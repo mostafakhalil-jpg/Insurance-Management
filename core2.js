@@ -1,0 +1,1304 @@
+
+/* ============================================================
+   MLIMS — Medical & Life Insurance Management System (KSA)
+   Single-file front-end. Data persisted in localStorage.
+   Every write passes through an audit-logged data layer.
+   ============================================================ */
+
+/* ---------------- utilities ---------------- */
+function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function todayISO(){return new Date().toISOString().slice(0,10);}
+function nowISO(){return new Date().toISOString();}
+function money(n,cur){return (cur||'SAR')+' '+Number(n||0).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:2});}
+function num(n){return Number(n||0).toLocaleString('en-US',{maximumFractionDigits:2});}
+function daysUntil(d){if(!d)return null;const t=new Date();t.setHours(0,0,0,0);const e=new Date(d);e.setHours(0,0,0,0);return Math.round((e-t)/86400000);}
+function addMonths(dateStr,m){const d=new Date(dateStr);d.setMonth(d.getMonth()+m);return d.toISOString().slice(0,10);}
+function addDay(d,n){const x=new Date(d);x.setDate(x.getDate()+n);return x.toISOString().slice(0,10);}
+function fmtDate(d){return d||'—';}
+function age(dob){if(!dob)return '';const d=daysUntil(dob);return Math.floor(-d/365.25);}
+function clone(o){return JSON.parse(JSON.stringify(o));}
+function toast(msg,type){const t=document.createElement('div');t.className='toast '+(type||'');t.textContent=msg;document.getElementById('toast').appendChild(t);setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity .3s';setTimeout(()=>t.remove(),300);},3400);}
+function val(id){const el=document.getElementById(id);return el?el.value:'';}
+
+/* ---------------- security model ---------------- */
+const ROLE_PERMS={
+  Admin:['*'],
+  HR:['master.edit','employee.edit','dependent.edit','policy.create','policy.edit','policy.suspend','policy.renew','policy.cancel','document.manage','import','export'],
+  Finance:['policy.edit','policy.renew','policy.cancel','document.manage','export'],
+  Manager:['policy.create','policy.edit','policy.suspend','export'],
+  Viewer:['export']
+};
+const ROLE_LABEL={Admin:'Administrator',HR:'HR',Finance:'Finance',Manager:'Manager',Viewer:'Viewer'};
+const ROLES=Object.keys(ROLE_PERMS);
+let SESSION=null;
+function can(a){if(!SESSION)return false;const p=ROLE_PERMS[SESSION.role]||[];return p.includes('*')||p.includes(a);}
+function isAdmin(){return SESSION&&SESSION.role==='Admin';}
+
+/* ---------------- audited data layer ---------------- */
+const KEY=c=>'mlims_'+c;
+const DB={
+  all(c){try{return JSON.parse(localStorage.getItem(KEY(c)))||[];}catch(e){return [];}},
+  _save(c,arr){localStorage.setItem(KEY(c),JSON.stringify(arr));},
+  byId(c,id){return DB.all(c).find(x=>x.id===id);},
+  insert(c,obj,opts){opts=opts||{};const arr=DB.all(c);obj.id=obj.id||uid();obj._createdAt=nowISO();obj._createdBy=SESSION?SESSION.username:'system';obj._updatedAt=obj._createdAt;arr.push(obj);DB._save(c,arr);if(!opts.silent)AUDIT.log('CREATE',c,obj.id,labelOf(c,obj),[]);return obj;},
+  update(c,id,patch,opts){opts=opts||{};const arr=DB.all(c);const i=arr.findIndex(x=>x.id===id);if(i<0)return null;const before=clone(arr[i]);const after=Object.assign({},arr[i],patch);after._updatedAt=nowISO();after._updatedBy=SESSION?SESSION.username:'system';arr[i]=after;DB._save(c,arr);if(!opts.silent)AUDIT.log('UPDATE',c,id,labelOf(c,after),diff(before,after));return after;},
+  remove(c,id){if(c==='audit'){toast('Audit records cannot be deleted.','err');return false;}const arr=DB.all(c);const rec=arr.find(x=>x.id===id);if(!rec)return false;DB._save(c,arr.filter(x=>x.id!==id));AUDIT.log('DELETE',c,id,labelOf(c,rec),[]);return true;}
+};
+function diff(a,b){const out=[];const keys=new Set([...Object.keys(a),...Object.keys(b)]);keys.forEach(k=>{if(k.startsWith('_')||k==='id')return;const ov=a[k],nv=b[k];const os=Array.isArray(ov)?JSON.stringify(ov):ov,ns=Array.isArray(nv)?JSON.stringify(nv):nv;if(String(os==null?'':os)!==String(ns==null?'':ns))out.push({field:k,old:ov,new:nv});});return out;}
+const AUDIT={
+  log(action,entity,recordId,recordLabel,changes){const arr=DB.all('audit');arr.push({id:uid(),ts:nowISO(),user:SESSION?SESSION.username:'system',role:SESSION?SESSION.role:'-',action,entity,recordId,recordLabel,changes:changes||[]});DB._save('audit',arr);}
+};
+function labelOf(c,obj){if(!obj)return '';
+  if(c==='employees')return obj.empNo||obj.name||obj.id;
+  if(c==='dependents')return obj.depNo||obj.name||obj.id;
+  if(c==='medPolicies'||c==='lifePolicies')return obj.policyNo||obj.id;
+  if(c==='users')return obj.username||obj.id;
+  const s=SCHEMA[c];if(s){const f=s.fields.find(f=>f.k==='name')||s.fields.find(f=>f.k==='code');if(f)return obj[f.k]||obj.id;}
+  return obj.name||obj.code||obj.id;}
+
+/* ---------------- master-data schema (generic CRUD engine) ----------------
+   field types: text, num, date, select(options), ref(collection), textarea, money, pct */
+const SCHEMA={
+  companies:{label:'Companies',icon:'🏢',group:'Organization',fields:[{k:'code',label:'Code'},{k:'name',label:'Company Name'},{k:'crNumber',label:'CR Number'}],display:['code','name','crNumber']},
+  businessUnits:{label:'Business Units',icon:'🏬',group:'Organization',fields:[{k:'code',label:'Code'},{k:'name',label:'Business Unit'},{k:'company',label:'Company',type:'ref',ref:'companies'}],display:['code','name','company']},
+  divisions:{label:'Divisions',icon:'🗂️',group:'Organization',fields:[{k:'code',label:'Code'},{k:'name',label:'Division'},{k:'company',label:'Company',type:'ref',ref:'companies'}],display:['code','name','company']},
+  departments:{label:'Departments',icon:'📁',group:'Organization',fields:[{k:'code',label:'Code'},{k:'name',label:'Department'},{k:'division',label:'Division',type:'ref',ref:'divisions'}],display:['code','name','division']},
+  insuranceCompanies:{label:'Insurance Companies',icon:'🏦',group:'Insurance',fields:[{k:'code',label:'Code'},{k:'name',label:'Company Name'},{k:'contact',label:'Contact Person'},{k:'phone',label:'Phone'},{k:'email',label:'Email'},{k:'address',label:'Address',type:'textarea'},{k:'notes',label:'Notes',type:'textarea'}],display:['code','name','contact','phone','email']}
+};
+const MASTER_ORDER=['companies','businessUnits','divisions','departments','insuranceCompanies'];
+
+/* ---------------- record entity field definitions ---------------- */
+const GENDERS=['Male','Female'];
+const RELATIONSHIPS=['Spouse','Son','Daughter','Father','Mother','Other'];
+/* insurance grade → class/network mapping (per agreed rate card) */
+const CLASSES=[
+  {code:'VIP',network:'NW7',grade:'GEN 19 + Above'},
+  {code:'A',network:'NW6',grade:'GEN 16 + Above'},
+  {code:'B',network:'NW3',grade:'GEN 13 + Above'},
+  {code:'C',network:'NW1',grade:'GEN 09 + Above'},
+  {code:'GEN.R',network:'NWM',grade:'GEN.R'}
+];
+const CLASS_CODES=CLASSES.map(c=>c.code);
+const MEMBER_TYPES=['Employee','Female Employee (With Mat)','Wife (With Maternity)','Wife (Without Maternity)','Child','Senior Employee','Parent','Others'];
+const EMP_FIELDS=[
+  {k:'empNo',label:'Employee Number',req:true},
+  {k:'name',label:'Employee Name',req:true},
+  {k:'iqama',label:'Iqama / National ID',req:true},
+  {k:'iqamaExpiry',label:'Iqama Expiry',type:'date'},
+  {k:'passport',label:'Passport Number'},
+  {k:'dob',label:'Date of Birth',type:'date'},
+  {k:'gender',label:'Gender',type:'select',options:GENDERS},
+  {k:'nationality',label:'Nationality'},
+  {k:'company',label:'Company',type:'ref',ref:'companies'},
+  {k:'businessUnit',label:'Business Unit',type:'ref',ref:'businessUnits'},
+  {k:'division',label:'Division',type:'ref',ref:'divisions'},
+  {k:'department',label:'Department',type:'ref',ref:'departments'},
+  {k:'grade',label:'Grade'},
+  {k:'insuranceClass',label:'Insurance Class',type:'select',options:CLASS_CODES},
+  {k:'jobTitle',label:'Job Title'},
+  {k:'mobile',label:'Mobile'},
+  {k:'email',label:'Email'},
+  {k:'status',label:'Status',type:'select',options:['Active','Inactive']}
+];
+const DEP_FIELDS=[
+  {k:'employeeId',label:'Employee',type:'ref',ref:'employees',req:true},
+  {k:'relationship',label:'Relationship',type:'select',options:RELATIONSHIPS,req:true},
+  {k:'name',label:'Dependent Name',req:true},
+  {k:'iqama',label:'Iqama / National ID',req:true},
+  {k:'iqamaExpiry',label:'Iqama Expiry',type:'date'},
+  {k:'passport',label:'Passport Number'},
+  {k:'dob',label:'Date of Birth',type:'date'},
+  {k:'gender',label:'Gender',type:'select',options:GENDERS},
+  {k:'status',label:'Status',type:'select',options:['Active','Inactive']}
+];
+
+/* policy configuration drives both medical & life engines */
+const POLICY_STATUSES=['Active','Suspended','Expired','Renewed','Cancelled'];
+const PSTATUS_PILL={Active:'green',Suspended:'amber',Expired:'red',Renewed:'purple',Cancelled:'grey'};
+const MED_FIELDS=[
+  {k:'policyNo',label:'Policy Number',req:true},
+  {k:'insurer',label:'Insurance Company',type:'ref',ref:'insuranceCompanies',req:true},
+  {k:'employeeId',label:'Employee',type:'empref',req:true},
+  {k:'plan',label:'Medical Plan',type:'select',options:['VIP','Class A','Class B','Class C']},
+  {k:'coverageClass',label:'Coverage Class',type:'select',options:['Employee Only','Employee + Spouse','Employee + Family']},
+  {k:'effectiveDate',label:'Effective Date',type:'date',req:true},
+  {k:'expiryDate',label:'Expiry Date',type:'date',req:true},
+  {k:'annualPremium',label:'Annual Premium',type:'money'},
+  {k:'companyContribution',label:'Company Contribution',type:'money'},
+  {k:'employeeContribution',label:'Employee Contribution',type:'money'}
+];
+const LIFE_FIELDS=[
+  {k:'policyNo',label:'Policy Number',req:true},
+  {k:'employeeId',label:'Employee',type:'empref',req:true},
+  {k:'insurer',label:'Insurance Company',type:'ref',ref:'insuranceCompanies',req:true},
+  {k:'sumAssured',label:'Sum Assured',type:'money'},
+  {k:'beneficiary',label:'Beneficiary'},
+  {k:'premium',label:'Premium',type:'money'},
+  {k:'effectiveDate',label:'Effective Date',type:'date',req:true},
+  {k:'expiryDate',label:'Expiry Date',type:'date',req:true}
+];
+const VEHICLE_FIELDS=[
+  {k:'policyNo',label:'Policy Number',req:true},
+  {k:'insurer',label:'Insurance Company',type:'ref',ref:'insuranceCompanies',req:true},
+  {k:'employeeId',label:'Driver / Custodian',type:'empref'},
+  {k:'vehicleMake',label:'Make & Model'},
+  {k:'plateNo',label:'Plate No.'},
+  {k:'vehicleYear',label:'Model Year'},
+  {k:'coverType',label:'Cover Type',type:'select',options:['Comprehensive','Third Party (TPL)']},
+  {k:'sumInsured',label:'Sum Insured',type:'money'},
+  {k:'premium',label:'Premium',type:'money'},
+  {k:'effectiveDate',label:'Effective Date',type:'date',req:true},
+  {k:'expiryDate',label:'Expiry Date',type:'date',req:true}
+];
+const POLICIES={
+  medical:{kind:'medical',coll:'medPolicies',label:'Medical Insurance',short:'Medical Policy',icon:'🏥',fields:MED_FIELDS,prefix:'MED',premiumKey:'annualPremium',empLabel:'Employee',listExtra:[{k:'plan',label:'Plan'},{k:'coverageClass',label:'Coverage'}]},
+  life:{kind:'life',coll:'lifePolicies',label:'Life Insurance',short:'Life Policy',icon:'🛡️',fields:LIFE_FIELDS,prefix:'LIF',premiumKey:'premium',empLabel:'Employee',listExtra:[{k:'sumAssured',label:'Sum Assured',money:true},{k:'beneficiary',label:'Beneficiary'}]},
+  vehicle:{kind:'vehicle',coll:'vehiclePolicies',label:'Vehicle Insurance',short:'Vehicle Policy',icon:'🚗',fields:VEHICLE_FIELDS,prefix:'VEH',premiumKey:'premium',empLabel:'Driver',optionalEmp:true,listExtra:[{k:'vehicleMake',label:'Vehicle'},{k:'plateNo',label:'Plate'}]}
+};
+const POLICY_KINDS=['medical','life','vehicle'];
+
+/* ---------------- ref helpers ---------------- */
+function refLabel(coll,id){if(!id)return '';const r=DB.byId(coll,id);if(!r)return id;if(coll==='employees')return (r.empNo?r.empNo+' — ':'')+(r.name||r.id);return r.name||r.code||r.id;}
+function refOptions(coll){if(coll==='employees')return DB.all('employees').map(e=>({id:e.id,label:(e.empNo?e.empNo+' — ':'')+(e.name||e.id)}));return DB.all(coll).map(r=>({id:r.id,label:(r.code?r.code+' — ':'')+(r.name||r.id)}));}
+function empName(id){const e=DB.byId('employees',id);return e?(e.empNo?e.empNo+' — ':'')+e.name:'';}
+function empOptions(currentId){let es=DB.all('employees').filter(e=>e.status==='Active'||e.id===currentId);return es.map(e=>({id:e.id,label:(e.empNo?e.empNo+' — ':'')+e.name+(e.status!=='Active'?' (Inactive)':'')}));}
+function empDivision(id){const e=DB.byId('employees',id);return e?e.division:'';}
+function empBusinessUnit(id){const e=DB.byId('employees',id);return e?e.businessUnit:'';}
+function empCompany(id){const e=DB.byId('employees',id);return e?e.company:'';}
+
+/* iqama uniqueness across employees + dependents */
+function iqamaClash(iqama,selfColl,selfId){
+  if(!iqama)return null;const v=String(iqama).trim().toLowerCase();
+  for(const e of DB.all('employees')){if(String(e.iqama||'').trim().toLowerCase()===v&&!(selfColl==='employees'&&e.id===selfId))return {coll:'employees',label:'Employee '+(e.empNo||e.name)};}
+  for(const d of DB.all('dependents')){if(String(d.iqama||'').trim().toLowerCase()===v&&!(selfColl==='dependents'&&d.id===selfId))return {coll:'dependents',label:'Dependent '+(d.name)};}
+  return null;
+}
+
+/* ---------------- premium rate card ---------------- */
+function getRateCard(){return DB.byId('premiumRates','card')||{id:'card',year:new Date().getFullYear(),rates:{}};}
+function premiumLookup(memberType,classCode){const c=getRateCard();return (c.rates&&c.rates[memberType]&&Number(c.rates[memberType][classCode]))||0;}
+function relMemberType(rel){if(rel==='Spouse')return 'Wife (Without Maternity)';if(rel==='Son'||rel==='Daughter')return 'Child';if(rel==='Father'||rel==='Mother')return 'Parent';return 'Others';}
+/* auto premium from grade/class + coverage scope (manual override always allowed) */
+function calcMedicalPremium(employeeId,coverageClass){
+  const e=DB.byId('employees',employeeId);if(!e)return 0;
+  const cls=e.insuranceClass||'B';
+  const empType=e.gender==='Female'?'Female Employee (With Mat)':'Employee';
+  let total=premiumLookup(empType,cls)||premiumLookup('Employee',cls);
+  if(coverageClass&&coverageClass!=='Employee Only'){
+    DB.all('dependents').filter(d=>d.employeeId===employeeId&&d.status==='Active').forEach(d=>{
+      if(coverageClass==='Employee + Spouse'&&d.relationship!=='Spouse')return;
+      total+=premiumLookup(relMemberType(d.relationship),cls);
+    });
+  }
+  return total;
+}
+
+/* ============================================================
+   SEED DATA
+   ============================================================ */
+function seedUsers(){
+  if(localStorage.getItem('mlims_users'))return;
+  DB._save('users',[
+    {id:uid(),username:'admin',password:'admin123',name:'System Administrator',role:'Admin',active:true},
+    {id:uid(),username:'hr',password:'hr123',name:'Hala Al-Qahtani',role:'HR',active:true},
+    {id:uid(),username:'finance',password:'finance123',name:'Yousef Al-Mutairi',role:'Finance',active:true},
+    {id:uid(),username:'manager',password:'manager123',name:'Tariq Al-Otaibi',role:'Manager',active:true},
+    {id:uid(),username:'viewer',password:'viewer123',name:'Audit Viewer',role:'Viewer',active:true}
+  ]);
+}
+function seedSettings(){
+  if(localStorage.getItem('mlims_settings'))return;
+  DB._save('settings',[{id:'singleton',reminderDays:[90,60,30,15,7],baseCurrency:'SAR'}]);
+}
+function getSettings(){const s=DB.byId('settings','singleton');return s||{reminderDays:[90,60,30,15,7],baseCurrency:'SAR'};}
+function seedRates(){
+  if(localStorage.getItem('mlims_premiumRates'))return;
+  const R={
+    'Employee':{'VIP':9324,'A':3983,'B':3115,'C':2238,'GEN.R':1184},
+    'Female Employee (With Mat)':{'VIP':13698,'A':6878,'B':4728,'C':3104,'GEN.R':1545},
+    'Wife (With Maternity)':{'VIP':13698,'A':6878,'B':4728,'C':3104,'GEN.R':1545},
+    'Wife (Without Maternity)':{'VIP':9324,'A':3983,'B':3115,'C':2238,'GEN.R':1184},
+    'Child':{'VIP':9324,'A':3983,'B':3115,'C':2238,'GEN.R':1184},
+    'Senior Employee':{'VIP':37298,'A':15932,'B':12857,'C':10070,'GEN.R':5329},
+    'Parent':{'VIP':57805,'A':24774,'B':20013,'C':15665,'GEN.R':8290},
+    'Others':{'VIP':9324,'A':3983,'B':3115,'C':2238,'GEN.R':1184}
+  };
+  DB._save('premiumRates',[{id:'card',year:2024,insurer:'',rates:R}]);
+}
+
+function seedAll(){
+  seedUsers();seedSettings();seedRates();
+  if(localStorage.getItem('mlims_seeded'))return;
+  const sil={silent:true};
+  const mk=(c,o)=>DB.insert(c,o,sil);
+  const d=(n)=>{const x=new Date();x.setDate(x.getDate()+n);return x.toISOString().slice(0,10);};
+  // organization
+  const co=mk('companies',{code:'NAGHI',name:'Naghi Holding Co.',crNumber:'1010012345'});
+  const co2=mk('companies',{code:'NAGHI-AUTO',name:'Naghi Automotive Ltd.',crNumber:'1010099221'});
+  const bu1=mk('businessUnits',{code:'BU-AUTO',name:'Automotive',company:co.id});
+  const bu2=mk('businessUnits',{code:'BU-RE',name:'Real Estate',company:co.id});
+  const bu3=mk('businessUnits',{code:'BU-LOG',name:'Logistics',company:co.id});
+  const divFleet=mk('divisions',{code:'D-OPS',name:'Operations',company:co.id});
+  const divHR=mk('divisions',{code:'D-HR',name:'Human Resources',company:co.id});
+  const divFin=mk('divisions',{code:'D-FIN',name:'Finance',company:co.id});
+  const divSales=mk('divisions',{code:'D-SAL',name:'Sales & Marketing',company:co.id});
+  const depOps=mk('departments',{code:'DEP-OPS',name:'Field Operations',division:divFleet.id});
+  const depPay=mk('departments',{code:'DEP-PAY',name:'Payroll',division:divHR.id});
+  const depAcc=mk('departments',{code:'DEP-ACC',name:'Accounting',division:divFin.id});
+  const depSal=mk('departments',{code:'DEP-SAL',name:'Showroom Sales',division:divSales.id});
+  // insurance companies
+  const insBupa=mk('insuranceCompanies',{code:'BUPA',name:'Bupa Arabia',contact:'Mr. Faisal Al-Harbi',phone:'+966 12 200 1000',email:'corporate@bupa.com.sa',address:'Jeddah, KSA',notes:'Primary medical TPA.'});
+  const insTaw=mk('insuranceCompanies',{code:'TAWUNIYA',name:'Tawuniya',contact:'Ms. Reem Saleh',phone:'+966 11 252 5000',email:'business@tawuniya.com.sa',address:'Riyadh, KSA',notes:''});
+  const insMed=mk('insuranceCompanies',{code:'MEDGULF',name:'MedGulf',contact:'Mr. Sami Nasser',phone:'+966 11 488 0123',email:'group@medgulf.com.sa',address:'Riyadh, KSA',notes:''});
+  const insGig=mk('insuranceCompanies',{code:'GIG',name:'GIG Gulf Saudi',contact:'Ms. Lina Omar',phone:'+966 12 690 7000',email:'life@gig.com.sa',address:'Jeddah, KSA',notes:'Group life carrier.'});
+  // employees
+  const E=(o)=>mk('employees',Object.assign({status:'Active',nationality:'Saudi',company:co.id,grade:'GEN 13',insuranceClass:'B'},o));
+  const e1=E({empNo:'E-1001',name:'Tariq Al-Otaibi',iqama:'2412345671',iqamaExpiry:d(120),passport:'A1234567',dob:'1985-03-12',gender:'Male',nationality:'Saudi',businessUnit:bu1.id,division:divFleet.id,department:depOps.id,jobTitle:'Operations Manager',grade:'GEN 16',insuranceClass:'A',mobile:'+966 50 111 2222',email:'tariq@naghi.com'});
+  const e2=E({empNo:'E-1002',name:'Hala Al-Qahtani',iqama:'2412345672',iqamaExpiry:d(20),passport:'B2233445',dob:'1990-07-25',gender:'Female',nationality:'Saudi',businessUnit:bu2.id,division:divHR.id,department:depPay.id,jobTitle:'HR Officer',mobile:'+966 50 333 4444',email:'hala@naghi.com'});
+  const e3=E({empNo:'E-1003',name:'Rajesh Kumar',iqama:'2456781234',iqamaExpiry:d(-5),passport:'P9988776',dob:'1988-11-02',gender:'Male',nationality:'Indian',businessUnit:bu3.id,division:divFleet.id,department:depOps.id,jobTitle:'Logistics Supervisor',mobile:'+966 54 777 8888',email:'rajesh@naghi.com'});
+  const e4=E({empNo:'E-1004',name:'Yousef Al-Mutairi',iqama:'2412345674',iqamaExpiry:d(300),passport:'C5566778',dob:'1982-01-19',gender:'Male',nationality:'Saudi',businessUnit:bu1.id,division:divFin.id,department:depAcc.id,jobTitle:'Finance Manager',grade:'GEN 19',insuranceClass:'VIP',mobile:'+966 55 222 3333',email:'yousef@naghi.com'});
+  const e5=E({empNo:'E-1005',name:'Maria Santos',iqama:'2466554433',iqamaExpiry:d(75),passport:'PH443322',dob:'1993-05-30',gender:'Female',nationality:'Filipino',businessUnit:bu2.id,division:divSales.id,department:depSal.id,jobTitle:'Sales Executive',mobile:'+966 56 909 1010',email:'maria@naghi.com'});
+  const e6=E({empNo:'E-1006',name:'Abdullah Al-Shehri',iqama:'2412345676',iqamaExpiry:d(210),passport:'D1122334',dob:'1979-09-08',gender:'Male',nationality:'Saudi',businessUnit:bu3.id,division:divFleet.id,department:depOps.id,jobTitle:'Warehouse Lead',grade:'GEN 09',insuranceClass:'C',mobile:'+966 53 444 5555',email:'abdullah@naghi.com'});
+  const e7=E({empNo:'E-1007',name:'Sara Al-Dossari',iqama:'2412345677',iqamaExpiry:d(45),passport:'E7788990',dob:'1995-12-14',gender:'Female',nationality:'Saudi',businessUnit:bu1.id,division:divSales.id,department:depSal.id,jobTitle:'Marketing Coordinator',mobile:'+966 50 656 7878',email:'sara@naghi.com'});
+  const e8=E({empNo:'E-1008',name:'John Mensah',iqama:'2433221100',iqamaExpiry:d(160),passport:'GH102030',dob:'1986-06-21',gender:'Male',nationality:'Ghanaian',status:'Inactive',businessUnit:bu3.id,division:divFleet.id,department:depOps.id,jobTitle:'Driver',mobile:'+966 59 121 3434',email:'john@naghi.com'});
+  // dependents
+  const D=(o)=>mk('dependents',Object.assign({status:'Active'},o));
+  D({depNo:'D-0001',employeeId:e1.id,relationship:'Spouse',name:'Amal Al-Otaibi',iqama:'2512345001',iqamaExpiry:d(120),gender:'Female',dob:'1988-04-10'});
+  D({depNo:'D-0002',employeeId:e1.id,relationship:'Son',name:'Faisal Al-Otaibi',iqama:'2512345002',iqamaExpiry:d(120),gender:'Male',dob:'2014-09-01'});
+  D({depNo:'D-0003',employeeId:e1.id,relationship:'Daughter',name:'Lujain Al-Otaibi',iqama:'2512345003',iqamaExpiry:d(15),gender:'Female',dob:'2017-02-17'});
+  D({depNo:'D-0004',employeeId:e4.id,relationship:'Spouse',name:'Noura Al-Mutairi',iqama:'2512345004',iqamaExpiry:d(300),gender:'Female',dob:'1985-08-23'});
+  D({depNo:'D-0005',employeeId:e5.id,relationship:'Son',name:'Diego Santos',iqama:'2512345005',iqamaExpiry:d(-2),gender:'Male',dob:'2012-11-11'});
+  D({depNo:'D-0006',employeeId:e7.id,relationship:'Mother',name:'Munira Al-Dossari',iqama:'2512345006',iqamaExpiry:d(60),gender:'Female',dob:'1960-01-05'});
+  // medical policies
+  const MP=(o)=>DB.insert('medPolicies',Object.assign({status:'Active',attachments:[]},o),sil);
+  MP({policyNo:'MED-2026-0001',insurer:insBupa.id,employeeId:e1.id,plan:'Class A',coverageClass:'Employee + Family',effectiveDate:d(-200),expiryDate:d(165),annualPremium:18500,companyContribution:18500,employeeContribution:0,attachments:[{name:'Bupa Card - Tariq.pdf',size:142000,type:'application/pdf',data:'#',category:'Insurance Card',expiry:'',uploadedAt:nowISO(),uploadedBy:'admin'}]});
+  MP({policyNo:'MED-2026-0002',insurer:insBupa.id,employeeId:e2.id,plan:'Class B',coverageClass:'Employee Only',effectiveDate:d(-150),expiryDate:d(25),annualPremium:9200,companyContribution:7000,employeeContribution:2200});
+  MP({policyNo:'MED-2026-0003',insurer:insTaw.id,employeeId:e3.id,plan:'Class C',coverageClass:'Employee Only',effectiveDate:d(-330),expiryDate:d(-12),annualPremium:6800,companyContribution:6800,employeeContribution:0});
+  MP({policyNo:'MED-2026-0004',insurer:insMed.id,employeeId:e4.id,plan:'VIP',coverageClass:'Employee + Family',effectiveDate:d(-90),expiryDate:d(275),annualPremium:27500,companyContribution:27500,employeeContribution:0});
+  MP({policyNo:'MED-2026-0005',insurer:insBupa.id,employeeId:e5.id,plan:'Class B',coverageClass:'Employee + Spouse',effectiveDate:d(-60),expiryDate:d(8),annualPremium:11400,companyContribution:8000,employeeContribution:3400});
+  MP({policyNo:'MED-2026-0006',insurer:insTaw.id,employeeId:e7.id,plan:'Class B',coverageClass:'Employee Only',effectiveDate:d(-20),expiryDate:d(345),annualPremium:9600,companyContribution:9600,employeeContribution:0,status:'Suspended'});
+  // life policies
+  const LP=(o)=>DB.insert('lifePolicies',Object.assign({status:'Active',attachments:[]},o),sil);
+  LP({policyNo:'LIF-2026-0001',employeeId:e1.id,insurer:insGig.id,sumAssured:1000000,beneficiary:'Amal Al-Otaibi (Spouse)',premium:3200,effectiveDate:d(-200),expiryDate:d(165)});
+  LP({policyNo:'LIF-2026-0002',employeeId:e4.id,insurer:insGig.id,sumAssured:1500000,beneficiary:'Noura Al-Mutairi (Spouse)',premium:4800,effectiveDate:d(-90),expiryDate:d(28)});
+  LP({policyNo:'LIF-2026-0003',employeeId:e6.id,insurer:insGig.id,sumAssured:750000,beneficiary:'Estate',premium:2400,effectiveDate:d(-300),expiryDate:d(-20)});
+  LP({policyNo:'LIF-2026-0004',employeeId:e2.id,insurer:insGig.id,sumAssured:600000,beneficiary:'Parents',premium:1900,effectiveDate:d(-40),expiryDate:d(320)});
+  // vehicle / motor policies
+  const VP=(o)=>DB.insert('vehiclePolicies',Object.assign({status:'Active',attachments:[]},o),sil);
+  VP({policyNo:'VEH-2026-0001',insurer:insTaw.id,employeeId:e1.id,vehicleMake:'Toyota Land Cruiser',plateNo:'RUH 4421',vehicleYear:'2024',coverType:'Comprehensive',sumInsured:320000,premium:8600,effectiveDate:d(-150),expiryDate:d(215)});
+  VP({policyNo:'VEH-2026-0002',insurer:insMed.id,employeeId:e3.id,vehicleMake:'Hyundai Staria',plateNo:'DMM 7782',vehicleYear:'2023',coverType:'Comprehensive',sumInsured:140000,premium:4200,effectiveDate:d(-300),expiryDate:d(18)});
+  VP({policyNo:'VEH-2026-0003',insurer:insTaw.id,employeeId:e6.id,vehicleMake:'Isuzu D-Max',plateNo:'JED 1199',vehicleYear:'2022',coverType:'Third Party (TPL)',sumInsured:0,premium:1450,effectiveDate:d(-330),expiryDate:d(-9)});
+  VP({policyNo:'VEH-2026-0004',insurer:insMed.id,employeeId:'',vehicleMake:'Mercedes Actros (Fleet)',plateNo:'DMM 5540',vehicleYear:'2021',coverType:'Comprehensive',sumInsured:480000,premium:15800,effectiveDate:d(-60),expiryDate:d(305)});
+  localStorage.setItem('mlims_seeded','1');
+}
+
+/* ---------------- policy effective status ---------------- */
+function policyEff(p){if(p.status==='Active'&&daysUntil(p.expiryDate)<0)return 'Expired';return p.status;}
+function premiumOf(cfg,p){return Number(p[cfg.premiumKey]||0);}
+
+/* ============================================================
+   AUTH + SHELL
+   ============================================================ */
+function doLogin(e){
+  e.preventDefault();
+  const u=document.getElementById('loginUser').value.trim();
+  const p=document.getElementById('loginPass').value;
+  const user=DB.all('users').find(x=>x.username.toLowerCase()===u.toLowerCase()&&x.password===p);
+  const err=document.getElementById('loginErr');
+  if(!user){err.textContent='Invalid username or password.';return false;}
+  if(!user.active){err.textContent='Account disabled. Contact your administrator.';return false;}
+  SESSION={id:user.id,username:user.username,name:user.name,role:user.role};
+  localStorage.setItem('mlims_session',JSON.stringify(SESSION));
+  AUDIT.log('LOGIN','session',user.id,user.username,[]);
+  startApp();return false;
+}
+function logout(){if(SESSION)AUDIT.log('LOGOUT','session',SESSION.id,SESSION.username,[]);localStorage.removeItem('mlims_session');location.reload();}
+
+const NAV=[
+  {sep:'Overview'},
+  {p:'dashboard',ico:'📊',label:'Dashboard'},
+  {p:'notifications',ico:'🔔',label:'Alerts',badge:'notif'},
+  {sep:'Records'},
+  {p:'employees',ico:'👤',label:'Employees'},
+  {p:'dependents',ico:'👨‍👩‍👧',label:'Dependents'},
+  {sep:'Insurance'},
+  {p:'medical',ico:'🏥',label:'Medical Insurance'},
+  {p:'life',ico:'🛡️',label:'Life Insurance'},
+  {p:'vehicle',ico:'🚗',label:'Vehicle Insurance'},
+  {p:'documents',ico:'📎',label:'Documents'},
+  {p:'reports',ico:'📈',label:'Reports'},
+  {sep:'Configuration'},
+  {p:'premiumRates',ico:'💲',label:'Premium Rates'},
+  {p:'master',ico:'🗄️',label:'Master Data'},
+  {sep:'Administration'},
+  {p:'users',ico:'👥',label:'Users & Roles',admin:'users.manage'},
+  {p:'audit',ico:'🛡️',label:'Audit Log'},
+  {p:'settings',ico:'⚙️',label:'Settings',admin:'settings.manage'}
+];
+let CURRENT='dashboard';
+function startApp(){
+  document.getElementById('loginView').style.display='none';
+  document.getElementById('appView').style.display='block';
+  document.getElementById('tbName').textContent=SESSION.name;
+  document.getElementById('tbRole').textContent=ROLE_LABEL[SESSION.role]||SESSION.role;
+  document.getElementById('tbAvatar').textContent=SESSION.name.split(' ').map(w=>w[0]).slice(0,2).join('').toUpperCase();
+  buildNav();refreshBadges();nav('dashboard');
+}
+function buildNav(){
+  const sb=document.getElementById('sidebar');
+  sb.innerHTML=NAV.map(n=>{
+    if(n.sep)return `<div class="nav-sep">${n.sep}</div>`;
+    if(n.admin&&!can(n.admin)&&!isAdmin())return '';
+    return `<div class="nav-item" data-p="${n.p}" onclick="nav('${n.p}')"><span class="ico">${n.ico}</span> ${n.label} ${n.badge?`<span class="nav-badge hidden" id="navb-${n.badge}">0</span>`:''}</div>`;
+  }).join('');
+}
+function nav(page,arg){
+  CURRENT=page;
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.p===page));
+  const m=document.getElementById('main');m.scrollTop=0;
+  const fn={dashboard:renderDashboard,notifications:renderNotifications,employees:renderEmployees,dependents:renderDependents,
+    medical:()=>renderPolicies('medical'),life:()=>renderPolicies('life'),vehicle:()=>renderPolicies('vehicle'),
+    documents:renderDocuments,reports:renderReports,premiumRates:renderPremiumRates,
+    master:renderMasterHub,users:renderUsers,audit:renderAudit,settings:renderSettings}[page];
+  (fn||renderDashboard)(arg);
+}
+function refreshBadges(){
+  const n=computeNotifications().length;
+  setBadge('navb-notif',n);
+  document.getElementById('tbBellCount').textContent=n||'';
+}
+function setBadge(id,n){const el=document.getElementById(id);if(!el)return;el.textContent=n;el.classList.toggle('hidden',!n);}
+
+/* ---------------- generic form renderer ---------------- */
+function fieldInput(f,val,ro,ctx){
+  const dis=ro?'disabled':'';const id='ff_'+f.k;
+  if(f.type==='textarea')return `<textarea id="${id}" rows="2" ${dis}>${esc(val||'')}</textarea>`;
+  if(f.type==='select')return `<select id="${id}" ${dis}><option value="">— select —</option>${f.options.map(o=>`<option ${String(val)===String(o)?'selected':''}>${esc(o)}</option>`).join('')}</select>`;
+  if(f.type==='ref'){const opts=refOptions(f.ref);return `<select id="${id}" ${dis}><option value="">— select —</option>${opts.map(o=>`<option value="${o.id}" ${val===o.id?'selected':''}>${esc(o.label)}</option>`).join('')}</select>`;}
+  if(f.type==='empref'){const opts=empOptions(val);return `<select id="${id}" ${dis}><option value="">— select active employee —</option>${opts.map(o=>`<option value="${o.id}" ${val===o.id?'selected':''}>${esc(o.label)}</option>`).join('')}</select>`;}
+  if(f.type==='date')return `<input id="${id}" type="date" value="${esc(val||'')}" ${dis}>`;
+  if(f.type==='num'||f.type==='money'||f.type==='pct')return `<input id="${id}" type="number" step="any" value="${val==null?'':val}" ${dis}>`;
+  return `<input id="${id}" value="${esc(val||'')}" ${dis}>`;
+}
+function readField(f){const el=document.getElementById('ff_'+f.k);if(!el)return undefined;let v=el.value;if(f.type==='num'||f.type==='money'||f.type==='pct')return v===''?'':Number(v);return v.trim?v.trim():v;}
+function cellVal(f,rec){const v=rec[f.k];if(f.type==='ref')return esc(refLabel(f.ref,v));if(f.type==='empref')return esc(empName(v));if(f.type==='pct')return v?v+'%':'';if(f.type==='money')return v?num(v):'';return esc(v==null?'':v);}
+function reqStar(f){return f.req?'<span class="req">*</span>':'';}
+
+/* ---------------- generic master engine ---------------- */
+let masterState={};
+function renderMaster(entity){
+  const s=SCHEMA[entity];const editable=can('master.edit');
+  const st=masterState[entity]||(masterState[entity]={q:''});
+  const main=document.getElementById('main');
+  main.innerHTML=`
+    <div class="page-head"><div><div class="crumb">Master Data › ${esc(s.group)}</div><h2>${s.icon} ${esc(s.label)}</h2></div>
+      <div class="actions">
+        <button class="btn btn-ghost" onclick="nav('master')">← Master Data</button>
+        ${can('export')?`<button class="btn btn-ghost" onclick="exportMaster('${entity}')">⬇ Excel</button>`:''}
+        ${editable&&can('import')?`<button class="btn btn-ghost" onclick="document.getElementById('impM').click()">⬆ Import</button><input type="file" id="impM" class="hidden" accept=".xlsx,.xls,.csv" onchange="importMaster('${entity}',this)">`:''}
+        ${editable?`<button class="btn" onclick="masterForm('${entity}')">+ New</button>`:''}
+      </div></div>
+    <div class="toolbar"><input class="grow" placeholder="🔍 Search…" value="${esc(st.q)}" oninput="masterState['${entity}'].q=this.value;drawMaster('${entity}')"></div>
+    <div class="card"><div class="table-wrap"><table>
+      <thead><tr>${s.display.map(k=>{const f=s.fields.find(f=>f.k===k);return `<th>${esc(f?f.label:k)}</th>`;}).join('')}<th class="right">Actions</th></tr></thead>
+      <tbody id="mBody"></tbody></table></div></div>`;
+  drawMaster(entity);
+}
+function drawMaster(entity){
+  const s=SCHEMA[entity];const editable=can('master.edit');
+  let rows=DB.all(entity);const q=(masterState[entity].q||'').toLowerCase();
+  if(q)rows=rows.filter(r=>s.fields.some(f=>String(f.type==='ref'?refLabel(f.ref,r[f.k]):r[f.k]||'').toLowerCase().includes(q)));
+  const body=document.getElementById('mBody');
+  if(!rows.length){body.innerHTML=`<tr><td colspan="${s.display.length+1}" class="empty">No records.</td></tr>`;return;}
+  body.innerHTML=rows.map(r=>`<tr>
+    ${s.display.map(k=>{const f=s.fields.find(f=>f.k===k);return `<td>${cellVal(f,r)}</td>`;}).join('')}
+    <td><div class="row-actions">
+      <button class="icon-btn" onclick="masterForm('${entity}','${r.id}')" title="${editable?'Edit':'View'}">${editable?'✏️':'👁'}</button>
+      ${isAdmin()?`<button class="icon-btn danger" onclick="masterDelete('${entity}','${r.id}')" title="Delete">🗑</button>`:''}
+    </div></td></tr>`).join('');
+}
+function masterForm(entity,id){
+  const s=SCHEMA[entity];const rec=id?DB.byId(entity,id):{};const ro=!can('master.edit');
+  modal((id?(ro?'View ':'Edit '):'New ')+s.label.replace(/s$/,''),
+    `<div class="form-grid">${s.fields.map(f=>`<div class="field ${f.type==='textarea'?'full':''}"><label>${esc(f.label)}</label>${fieldInput(f,rec[f.k],ro)}</div>`).join('')}</div>`,
+    ro?[{label:'Close',cls:'btn-ghost',fn:closeModal}]:[
+      {label:'Cancel',cls:'btn-ghost',fn:closeModal},
+      {label:id?'Save':'Create',cls:'btn',fn:()=>{
+        const patch={};s.fields.forEach(f=>patch[f.k]=readField(f));
+        if(!patch.name){toast('Name is required.','err');return;}
+        if(id)DB.update(entity,id,patch);else DB.insert(entity,patch);
+        closeModal();drawMaster(entity);toast(s.label.replace(/s$/,'')+' saved.','ok');
+      }}
+    ]);
+}
+function masterDelete(entity,id){
+  const rec=DB.byId(entity,id);
+  confirmBox('Delete record',`Delete <b>${esc(labelOf(entity,rec))}</b>? Linked records may reference it.`,()=>{
+    DB.remove(entity,id);drawMaster(entity);toast('Deleted.','ok');
+  });
+}
+function renderMasterHub(){
+  const main=document.getElementById('main');
+  const groups={};MASTER_ORDER.forEach(e=>{const g=SCHEMA[e].group;(groups[g]=groups[g]||[]).push(e);});
+  main.innerHTML=`<div class="page-head"><div><div class="crumb">Configuration</div><h2>🗄️ Master Data</h2></div></div>
+    ${Object.entries(groups).map(([g,ents])=>`
+      <div class="card"><div class="card-h">${esc(g)}</div><div class="card-b"><div class="hub-grid">
+        ${ents.map(e=>`<div class="hub-card" onclick="renderMaster('${e}')"><div class="hc-ico">${SCHEMA[e].icon}</div><div class="hc-name">${esc(SCHEMA[e].label)}</div><div class="hc-count">${DB.all(e).length} record(s)</div></div>`).join('')}
+      </div></div></div>`).join('')}`;
+}
+function exportMaster(entity){
+  const s=SCHEMA[entity];const rows=DB.all(entity).map(r=>{const o={};s.fields.forEach(f=>o[f.label]=f.type==='ref'?refLabel(f.ref,r[f.k]):r[f.k]);return o;});
+  sheetDownload(rows,s.label,entity);
+}
+function importMaster(entity,input){
+  const s=SCHEMA[entity];const f=input.files[0];if(!f)return;const r=new FileReader();
+  r.onload=e=>{try{
+    const wb=XLSX.read(e.target.result,{type:'array'});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
+    let n=0,dup=0;rows.forEach(row=>{const patch={};s.fields.forEach(f=>{for(const k in row){if(k.toLowerCase().replace(/[^a-z]/g,'')===f.label.toLowerCase().replace(/[^a-z]/g,'')||k.toLowerCase()===f.k.toLowerCase())patch[f.k]=f.type==='ref'?(DB.all(f.ref).find(x=>(x.name||'').toLowerCase()===String(row[k]).toLowerCase()||(x.code||'').toLowerCase()===String(row[k]).toLowerCase())||{}).id||'':row[k];}});
+      if(patch.code&&DB.all(entity).some(x=>String(x.code||'').toLowerCase()===String(patch.code).toLowerCase())){dup++;return;}
+      if(Object.values(patch).some(v=>v!==''&&v!=null)){DB.insert(entity,patch);n++;}});
+    drawMaster(entity);toast(`Imported ${n} record(s).${dup?' '+dup+' duplicate(s) skipped.':''}`,'ok');
+  }catch(err){toast('Import failed: '+err.message,'err');}};
+  r.readAsArrayBuffer(f);input.value='';
+}
+
+/* ---------------- shared excel helper ---------------- */
+function sheetDownload(rows,sheetName,fileName){
+  const ws=XLSX.utils.json_to_sheet(rows.length?rows:[{Info:'No data'}]);
+  const cols=rows.length?Object.keys(rows[0]):['Info'];ws['!cols']=cols.map(c=>({wch:Math.max(12,c.length+2)}));
+  const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,(sheetName||'Sheet').slice(0,31));
+  XLSX.writeFile(wb,`MLIMS_${fileName||'export'}_${todayISO()}.xlsx`);
+  toast('Exported to Excel.','ok');
+}
+function normDate(v){if(!v)return '';if(typeof v==='number'){const x=XLSX.SSF.parse_date_code(v);if(x)return `${x.y}-${String(x.m).padStart(2,'0')}-${String(x.d).padStart(2,'0')}`;}const dt=new Date(String(v));return isNaN(dt)?String(v):dt.toISOString().slice(0,10);}
+
+/* ---------------- modal ---------------- */
+function modal(title,body,buttons,wide){
+  document.getElementById('modalRoot').innerHTML=`<div class="modal-bg" onclick="if(event.target===this)closeModal()">
+    <div class="modal ${wide?'wide':''}"><div class="modal-h"><h3>${esc(title)}</h3><button class="close-x" onclick="closeModal()">×</button></div>
+      <div class="modal-b">${body}</div><div class="modal-f" id="modalF"></div></div></div>`;
+  const f=document.getElementById('modalF');
+  (buttons||[]).forEach(b=>{const x=document.createElement('button');x.className='btn '+(b.cls||'');x.textContent=b.label;x.onclick=b.fn;f.appendChild(x);});
+}
+function closeModal(){document.getElementById('modalRoot').innerHTML='';}
+function confirmBox(title,html,onYes){modal(title,`<p style="line-height:1.6">${html}</p>`,[{label:'Cancel',cls:'btn-ghost',fn:closeModal},{label:'Confirm',cls:'btn-danger',fn:()=>{closeModal();onYes();}}]);}
+function kv(label,val){return `<div style="display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--line)"><span class="muted">${esc(label)}</span><span style="text-align:right;font-weight:500">${val||'—'}</span></div>`;}
+function fmtChange(v){if(v==null||v==='')return '∅';return String(v).slice(0,40);}
+
+/* ============================================================
+   EMPLOYEES
+   ============================================================ */
+let empQ='';
+function renderEmployees(){
+  const editable=can('employee.edit');
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Records</div><h2>👤 Employees</h2></div>
+      <div class="actions">
+        ${can('export')?`<button class="btn btn-ghost" onclick="exportEmployees()">⬇ Excel</button>`:''}
+        ${editable&&can('import')?`<button class="btn btn-ghost" onclick="document.getElementById('impE').click()">⬆ Import</button><input type="file" id="impE" class="hidden" accept=".xlsx,.xls,.csv" onchange="importEmployees(this)">`:''}
+        ${editable?`<button class="btn" onclick="employeeForm()">+ New Employee</button>`:''}
+      </div></div>
+    <div class="toolbar"><input class="grow" placeholder="🔍 Search name, employee no, Iqama…" value="${esc(empQ)}" oninput="empQ=this.value;drawEmployees()"></div>
+    <div class="card"><div class="table-wrap"><table>
+      <thead><tr><th>Emp No.</th><th>Name</th><th>Iqama / ID</th><th>Division</th><th>Job Title</th><th class="center">Deps</th><th class="center">Policies</th><th>Status</th><th class="right">Actions</th></tr></thead>
+      <tbody id="eBody"></tbody></table></div></div>`;
+  drawEmployees();
+}
+function drawEmployees(){
+  let rows=DB.all('employees');const q=empQ.toLowerCase();
+  if(q)rows=rows.filter(e=>[e.empNo,e.name,e.iqama,refLabel('divisions',e.division),e.jobTitle].join(' ').toLowerCase().includes(q));
+  rows.sort((a,b)=>(a.empNo||'').localeCompare(b.empNo||''));
+  const body=document.getElementById('eBody');
+  if(!rows.length){body.innerHTML=`<tr><td colspan="9" class="empty">No employees.</td></tr>`;return;}
+  body.innerHTML=rows.map(e=>{
+    const deps=DB.all('dependents').filter(d=>d.employeeId===e.id).length;
+    const pol=DB.all('medPolicies').filter(p=>p.employeeId===e.id).length+DB.all('lifePolicies').filter(p=>p.employeeId===e.id).length+DB.all('vehiclePolicies').filter(p=>p.employeeId===e.id).length;
+    const ix=daysUntil(e.iqamaExpiry);
+    const iqamaCell=esc(e.iqama||'—')+(e.iqamaExpiry?(ix<0?` <span class="pill red">ID expired</span>`:ix<=30?` <span class="pill amber">${ix}d</span>`:''):'');
+    return `<tr style="cursor:pointer" onclick="renderEmployeeDetail('${e.id}')">
+      <td><b>${esc(e.empNo)}</b></td><td>${esc(e.name)}</td><td>${iqamaCell}</td>
+      <td>${esc(refLabel('divisions',e.division))}</td><td>${esc(e.jobTitle||'—')}</td>
+      <td class="center">${deps||'—'}</td><td class="center">${pol||'—'}</td>
+      <td><span class="pill ${e.status==='Active'?'green':'grey'}">${esc(e.status||'—')}</span></td>
+      <td onclick="event.stopPropagation()"><div class="row-actions">
+        <button class="icon-btn" onclick="renderEmployeeDetail('${e.id}')" title="Open">👁</button>
+        ${can('employee.edit')?`<button class="icon-btn" onclick="employeeForm('${e.id}')" title="Edit">✏️</button>`:''}
+        ${isAdmin()?`<button class="icon-btn danger" onclick="deleteEmployee('${e.id}')" title="Delete">🗑</button>`:''}
+      </div></td></tr>`;
+  }).join('');
+}
+function autoEmpNo(){const n=DB.all('employees').length+1;return 'E-'+String(1000+n);}
+function employeeForm(id){
+  const rec=id?DB.byId('employees',id):{status:'Active',nationality:'Saudi',empNo:autoEmpNo()};const ro=!can('employee.edit');
+  modal((id?(ro?'View ':'Edit '):'New ')+'Employee',
+    `<div class="form-grid">${EMP_FIELDS.map(f=>`<div class="field"><label>${esc(f.label)} ${reqStar(f)}</label>${fieldInput(f,rec[f.k],ro)}</div>`).join('')}</div>
+     <p class="help" style="margin-top:8px;color:var(--muted);font-size:11.5px">Employee Number and Iqama/National ID must be unique. Iqama is checked against both employees and dependents.</p>`,
+    ro?[{label:'Close',cls:'btn-ghost',fn:closeModal}]:[
+      {label:'Cancel',cls:'btn-ghost',fn:closeModal},
+      {label:id?'Save':'Create',cls:'btn',fn:()=>saveEmployee(id)}
+    ],true);
+}
+function saveEmployee(id){
+  const patch={};EMP_FIELDS.forEach(f=>patch[f.k]=readField(f));
+  if(!patch.empNo){toast('Employee Number is required.','err');return;}
+  if(!patch.name){toast('Employee Name is required.','err');return;}
+  if(!patch.iqama){toast('Iqama / National ID is required.','err');return;}
+  if(DB.all('employees').some(e=>String(e.empNo||'').toLowerCase()===patch.empNo.toLowerCase()&&e.id!==id)){toast('Employee Number already exists.','err');return;}
+  const clash=iqamaClash(patch.iqama,'employees',id);
+  if(clash){toast('Iqama/ID already used by '+clash.label+'.','err');return;}
+  if(id)DB.update('employees',id,patch);else DB.insert('employees',patch);
+  closeModal();toast('Employee saved.','ok');refreshBadges();
+  if(CURRENT==='employees')drawEmployees();else renderEmployeeDetail(id||DB.all('employees').slice(-1)[0].id);
+}
+function deleteEmployee(id){
+  const e=DB.byId('employees',id);
+  const deps=DB.all('dependents').filter(d=>d.employeeId===id).length;
+  const pol=DB.all('medPolicies').filter(p=>p.employeeId===id).length+DB.all('lifePolicies').filter(p=>p.employeeId===id).length;
+  confirmBox('Delete employee',`Delete <b>${esc(e.name)}</b>?${deps||pol?` This employee has ${deps} dependent(s) and ${pol} policy(ies) which will be left orphaned.`:''} Audit history is retained.`,()=>{
+    DB.remove('employees',id);refreshBadges();drawEmployees();toast('Employee deleted.','ok');
+  });
+}
+function exportEmployees(){
+  const rows=DB.all('employees').map(e=>{const o={};EMP_FIELDS.forEach(f=>o[f.label]=f.type==='ref'?refLabel(f.ref,e[f.k]):e[f.k]);o['Dependents']=DB.all('dependents').filter(d=>d.employeeId===e.id).length;o['Medical Policies']=DB.all('medPolicies').filter(p=>p.employeeId===e.id).length;o['Life Policies']=DB.all('lifePolicies').filter(p=>p.employeeId===e.id).length;return o;});
+  sheetDownload(rows,'Employees','employees');
+}
+function importEmployees(input){
+  const f=input.files[0];if(!f)return;const r=new FileReader();
+  r.onload=e=>{try{
+    const wb=XLSX.read(e.target.result,{type:'array'});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
+    let n=0,dup=0;rows.forEach(row=>{const get=names=>{for(const k in row){const kk=k.toLowerCase().replace(/[^a-z]/g,'');if(names.some(x=>kk.includes(x)))return row[k];}return '';};
+      const empNo=String(get(['employeeno','empno','number'])||'').trim();const iqama=String(get(['iqama','nationalid','id'])||'').trim();const name=String(get(['employeename','name'])||'').trim();
+      if(!empNo||!name||!iqama)return;
+      if(DB.all('employees').some(x=>String(x.empNo||'').toLowerCase()===empNo.toLowerCase())){dup++;return;}
+      if(iqamaClash(iqama,'employees',null)){dup++;return;}
+      const findRef=(coll,v)=>{v=String(v||'').toLowerCase();const r=DB.all(coll).find(x=>(x.name||'').toLowerCase()===v||(x.code||'').toLowerCase()===v);return r?r.id:'';};
+      DB.insert('employees',{empNo,name,iqama,iqamaExpiry:normDate(get(['iqamaexpiry','idexpiry'])),passport:String(get(['passport'])||''),dob:normDate(get(['dateofbirth','dob'])),gender:String(get(['gender'])||''),nationality:String(get(['nationality'])||''),company:findRef('companies',get(['company'])),businessUnit:findRef('businessUnits',get(['businessunit'])),division:findRef('divisions',get(['division'])),department:findRef('departments',get(['department'])),jobTitle:String(get(['jobtitle','title'])||''),mobile:String(get(['mobile','phone'])||''),email:String(get(['email'])||''),status:String(get(['status'])||'Active')||'Active'});n++;});
+    refreshBadges();drawEmployees();toast(`Imported ${n} employee(s).${dup?' '+dup+' duplicate(s) skipped.':''}`,'ok');
+  }catch(err){toast('Import failed: '+err.message,'err');}};
+  r.readAsArrayBuffer(f);input.value='';
+}
+
+/* ---------- employee detail ---------- */
+let empTab='details';
+function renderEmployeeDetail(id,tab){
+  const e=DB.byId('employees',id);if(!e){nav('employees');return;}
+  empTab=tab||'details';
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div>
+      <div class="crumb"><a href="#" onclick="nav('employees');return false" style="color:var(--muted)">Employees</a> › ${esc(e.empNo)}</div>
+      <h2>${esc(e.name)} <span class="pill ${e.status==='Active'?'green':'grey'}" style="font-size:12px;vertical-align:middle">${esc(e.status)}</span></h2>
+      <div class="muted">${esc(e.empNo)} · ${esc(e.jobTitle||'')} · ${esc(refLabel('divisions',e.division))}</div>
+    </div>
+    <div class="actions">
+      ${can('policy.create')?`<button class="btn btn-ghost" onclick="policyForm('medical',null,'${e.id}')">+ Medical</button><button class="btn btn-ghost" onclick="policyForm('life',null,'${e.id}')">+ Life</button><button class="btn btn-ghost" onclick="policyForm('vehicle',null,'${e.id}')">+ Vehicle</button>`:''}
+      ${can('dependent.edit')?`<button class="btn btn-ghost" onclick="dependentForm(null,'${e.id}')">+ Dependent</button>`:''}
+      ${can('employee.edit')?`<button class="btn" onclick="employeeForm('${e.id}')">✏️ Edit</button>`:''}
+    </div></div>
+    <div class="tabs">
+      ${['details','dependents','policies','documents','history'].map(t=>`<div class="tab ${empTab===t?'active':''}" onclick="renderEmployeeDetail('${id}','${t}')">${({details:'Details',dependents:'Dependents',policies:'Policies',documents:'Documents',history:'Change History'})[t]}</div>`).join('')}
+    </div>
+    <div id="edBody"></div>`;
+  const b=document.getElementById('edBody');
+  if(empTab==='details')b.innerHTML=empDetails(e);
+  if(empTab==='dependents')b.innerHTML=empDependents(e);
+  if(empTab==='policies')b.innerHTML=empPolicies(e);
+  if(empTab==='documents')renderEntityDocs('employees',e.id,'edBody',()=>renderEmployeeDetail(id,'documents'));
+  if(empTab==='history')b.innerHTML=entityHistory('employees',e.id);
+}
+function empDetails(e){
+  const ix=daysUntil(e.iqamaExpiry);
+  return `<div class="grid2">
+    <div class="card"><div class="card-h">Personal</div><div class="card-b">
+      ${kv('Employee Number',esc(e.empNo))}
+      ${kv('Iqama / National ID',esc(e.iqama))}
+      ${kv('Iqama Expiry',e.iqamaExpiry?fmtDate(e.iqamaExpiry)+(ix<0?' <span class="pill red">Expired</span>':ix<=30?` <span class="pill amber">${ix}d</span>`:''):'—')}
+      ${kv('Passport',esc(e.passport))}
+      ${kv('Date of Birth',e.dob?fmtDate(e.dob)+` (${age(e.dob)} yrs)`:'—')}
+      ${kv('Gender',esc(e.gender))}
+      ${kv('Nationality',esc(e.nationality))}
+    </div></div>
+    <div class="card"><div class="card-h">Organization & Contact</div><div class="card-b">
+      ${kv('Company',esc(refLabel('companies',e.company)))}
+      ${kv('Business Unit',esc(refLabel('businessUnits',e.businessUnit)))}
+      ${kv('Division',esc(refLabel('divisions',e.division)))}
+      ${kv('Department',esc(refLabel('departments',e.department)))}
+      ${kv('Job Title',esc(e.jobTitle))}
+      ${kv('Mobile',esc(e.mobile))}
+      ${kv('Email',esc(e.email))}
+      ${kv('Status',e.status)}
+    </div></div>
+  </div>`;
+}
+function empDependents(e){
+  const deps=DB.all('dependents').filter(d=>d.employeeId===e.id);
+  return `<div class="card"><div class="card-h">Dependents <span class="sub">${deps.length}</span>
+    ${can('dependent.edit')?`<button class="btn btn-sm" onclick="dependentForm(null,'${e.id}')">+ Add Dependent</button>`:''}</div>
+    <div class="table-wrap"><table><thead><tr><th>Dep No.</th><th>Name</th><th>Relationship</th><th>Iqama / ID</th><th>Age</th><th>Status</th><th class="right">Actions</th></tr></thead>
+    <tbody>${deps.length?deps.map(d=>`<tr><td><b>${esc(d.depNo||'—')}</b></td><td>${esc(d.name)}</td><td>${esc(d.relationship)}</td><td>${esc(d.iqama)}</td><td>${d.dob?age(d.dob):'—'}</td>
+      <td><span class="pill ${d.status==='Active'?'green':'grey'}">${esc(d.status)}</span></td>
+      <td class="right">${can('dependent.edit')?`<button class="icon-btn" onclick="dependentForm('${d.id}')">✏️</button>`:'—'}</td></tr>`).join(''):`<tr><td colspan="7" class="empty">No dependents registered.</td></tr>`}</tbody></table></div></div>`;
+}
+function empPolicies(e){
+  const med=DB.all('medPolicies').filter(p=>p.employeeId===e.id);
+  const life=DB.all('lifePolicies').filter(p=>p.employeeId===e.id);
+  const veh=DB.all('vehiclePolicies').filter(p=>p.employeeId===e.id);
+  const tbl=(cfg,list)=>`<div class="card"><div class="card-h">${cfg.icon} ${cfg.label} <span class="sub">${list.length}</span>
+    ${can('policy.create')?`<button class="btn btn-sm" onclick="policyForm('${cfg.kind}',null,'${e.id}')">+ Add</button>`:''}</div>
+    <div class="table-wrap"><table><thead><tr><th>Policy No.</th><th>Insurer</th><th>Effective</th><th>Expiry</th><th class="right">${cfg.kind==='medical'?'Annual Premium':'Premium'}</th><th>Status</th><th class="right"></th></tr></thead>
+    <tbody>${list.length?list.map(p=>{const es=policyEff(p);return `<tr><td><a href="#" onclick="renderPolicyDetail('${cfg.kind}','${p.id}');return false"><b>${esc(p.policyNo)}</b></a></td><td>${esc(refLabel('insuranceCompanies',p.insurer))}</td><td>${fmtDate(p.effectiveDate)}</td><td>${fmtDate(p.expiryDate)}</td><td class="right">${num(premiumOf(cfg,p))}</td><td><span class="pill ${PSTATUS_PILL[es]}">${es}</span></td><td class="right"><button class="icon-btn" onclick="renderPolicyDetail('${cfg.kind}','${p.id}')">👁</button></td></tr>`;}).join(''):`<tr><td colspan="7" class="empty">No ${cfg.kind} policies.</td></tr>`}</tbody></table></div></div>`;
+  return tbl(POLICIES.medical,med)+tbl(POLICIES.life,life)+tbl(POLICIES.vehicle,veh);
+}
+function entityHistory(coll,id){
+  const logs=DB.all('audit').filter(a=>a.entity===coll&&a.recordId===id).sort((a,b)=>b.ts.localeCompare(a.ts));
+  return `<div class="card"><div class="card-h">Change History <span class="sub">immutable audit trail</span></div><div class="card-b">
+    <div class="tl">${logs.length?logs.map(l=>`<div class="tl-item"><b>${esc(l.action)}</b> by ${esc(l.user)} <span class="muted">(${esc(l.role)}) · ${new Date(l.ts).toLocaleString()}</span>${l.changes&&l.changes.length?`<div class="muted" style="font-size:12px;margin-top:3px">${l.changes.map(ch=>`${esc(ch.field)}: <s>${esc(fmtChange(ch.old))}</s> → ${esc(fmtChange(ch.new))}`).join('<br>')}</div>`:''}</div>`).join(''):'<span class="muted">No changes recorded.</span>'}</div>
+  </div></div>`;
+}
+
+/* ============================================================
+   DEPENDENTS
+   ============================================================ */
+let depQ='';
+function renderDependents(){
+  const editable=can('dependent.edit');
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Records</div><h2>👨‍👩‍👧 Dependents</h2></div>
+      <div class="actions">
+        ${can('export')?`<button class="btn btn-ghost" onclick="exportDependents()">⬇ Excel</button>`:''}
+        ${editable&&can('import')?`<button class="btn btn-ghost" onclick="document.getElementById('impD').click()">⬆ Import</button><input type="file" id="impD" class="hidden" accept=".xlsx,.xls,.csv" onchange="importDependents(this)">`:''}
+        ${editable?`<button class="btn" onclick="dependentForm()">+ New Dependent</button>`:''}
+      </div></div>
+    <div class="toolbar"><input class="grow" placeholder="🔍 Search name, Iqama, employee…" value="${esc(depQ)}" oninput="depQ=this.value;drawDependents()"></div>
+    <div class="card"><div class="table-wrap"><table>
+      <thead><tr><th>Dep No.</th><th>Name</th><th>Relationship</th><th>Employee</th><th>Iqama / ID</th><th>Age</th><th>Status</th><th class="right">Actions</th></tr></thead>
+      <tbody id="dBody"></tbody></table></div></div>`;
+  drawDependents();
+}
+function drawDependents(){
+  let rows=DB.all('dependents');const q=depQ.toLowerCase();
+  if(q)rows=rows.filter(d=>[d.depNo,d.name,d.iqama,d.relationship,empName(d.employeeId)].join(' ').toLowerCase().includes(q));
+  rows.sort((a,b)=>(a.depNo||'').localeCompare(b.depNo||''));
+  const body=document.getElementById('dBody');
+  if(!rows.length){body.innerHTML=`<tr><td colspan="8" class="empty">No dependents.</td></tr>`;return;}
+  body.innerHTML=rows.map(d=>{
+    const ix=daysUntil(d.iqamaExpiry);
+    const iqamaCell=esc(d.iqama||'—')+(d.iqamaExpiry?(ix<0?` <span class="pill red">ID expired</span>`:ix<=30?` <span class="pill amber">${ix}d</span>`:''):'');
+    return `<tr>
+      <td><b>${esc(d.depNo||'—')}</b></td><td>${esc(d.name)}</td><td>${esc(d.relationship)}</td>
+      <td><a href="#" onclick="renderEmployeeDetail('${d.employeeId}','dependents');return false">${esc(empName(d.employeeId))}</a></td>
+      <td>${iqamaCell}</td><td>${d.dob?age(d.dob):'—'}</td>
+      <td><span class="pill ${d.status==='Active'?'green':'grey'}">${esc(d.status||'—')}</span></td>
+      <td><div class="row-actions">
+        ${can('dependent.edit')?`<button class="icon-btn" onclick="dependentForm('${d.id}')" title="Edit">✏️</button>`:`<button class="icon-btn" onclick="dependentForm('${d.id}')" title="View">👁</button>`}
+        ${isAdmin()?`<button class="icon-btn danger" onclick="confirmBox('Delete dependent','Delete <b>${esc(d.name)}</b>?',()=>{DB.remove('dependents','${d.id}');refreshBadges();drawDependents();toast('Deleted.','ok');})">🗑</button>`:''}
+      </div></td></tr>`;
+  }).join('');
+}
+function autoDepNo(){const n=DB.all('dependents').length+1;return 'D-'+String(n).padStart(4,'0');}
+function dependentForm(id,presetEmp){
+  const rec=id?DB.byId('dependents',id):{status:'Active',depNo:autoDepNo(),employeeId:presetEmp||''};const ro=!can('dependent.edit');
+  modal((id?(ro?'View ':'Edit '):'New ')+'Dependent',
+    `<div class="form-grid">${DEP_FIELDS.map(f=>`<div class="field"><label>${esc(f.label)} ${reqStar(f)}</label>${fieldInput(f,rec[f.k],ro)}</div>`).join('')}</div>
+     <p class="help" style="margin-top:8px;color:var(--muted);font-size:11.5px">Iqama/ID must be unique across all employees and dependents. A dependent can belong to only one employee, and an employee cannot be registered as a dependent.</p>`,
+    ro?[{label:'Close',cls:'btn-ghost',fn:closeModal}]:[
+      {label:'Cancel',cls:'btn-ghost',fn:closeModal},
+      {label:id?'Save':'Create',cls:'btn',fn:()=>saveDependent(id)}
+    ],true);
+}
+function saveDependent(id){
+  const patch={};DEP_FIELDS.forEach(f=>patch[f.k]=readField(f));
+  if(!patch.employeeId){toast('Employee is required.','err');return;}
+  if(!patch.name){toast('Dependent Name is required.','err');return;}
+  if(!patch.iqama){toast('Iqama / National ID is required.','err');return;}
+  // employee cannot be registered as a dependent
+  if(DB.all('employees').some(e=>String(e.iqama||'').trim().toLowerCase()===patch.iqama.trim().toLowerCase())){toast('This Iqama/ID belongs to an employee — an employee cannot be a dependent.','err');return;}
+  const clash=iqamaClash(patch.iqama,'dependents',id);
+  if(clash){toast('Iqama/ID already used by '+clash.label+'.','err');return;}
+  if(id)DB.update('dependents',id,patch);else DB.insert('dependents',patch);
+  closeModal();refreshBadges();toast('Dependent saved.','ok');
+  if(CURRENT==='employees')renderEmployeeDetail(patch.employeeId,'dependents');
+  else if(CURRENT==='dependents')drawDependents();
+}
+function exportDependents(){
+  const rows=DB.all('dependents').map(d=>({'Dependent No':d.depNo,'Employee No':(DB.byId('employees',d.employeeId)||{}).empNo||'','Employee':empName(d.employeeId),'Relationship':d.relationship,'Dependent Name':d.name,'Iqama / National ID':d.iqama,'Iqama Expiry':d.iqamaExpiry,'Passport':d.passport,'Date of Birth':d.dob,'Gender':d.gender,'Status':d.status}));
+  sheetDownload(rows,'Dependents','dependents');
+}
+function importDependents(input){
+  const f=input.files[0];if(!f)return;const r=new FileReader();
+  r.onload=e=>{try{
+    const wb=XLSX.read(e.target.result,{type:'array'});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
+    let n=0,dup=0,noemp=0;rows.forEach(row=>{const get=names=>{for(const k in row){const kk=k.toLowerCase().replace(/[^a-z]/g,'');if(names.some(x=>kk.includes(x)))return row[k];}return '';};
+      const name=String(get(['dependentname','name'])||'').trim();const iqama=String(get(['iqama','nationalid','id'])||'').trim();
+      const empRef=String(get(['employeeno','empno','employee'])||'').trim().toLowerCase();
+      if(!name||!iqama||!empRef)return;
+      const emp=DB.all('employees').find(x=>String(x.empNo||'').toLowerCase()===empRef||(x.name||'').toLowerCase()===empRef);
+      if(!emp){noemp++;return;}
+      if(DB.all('employees').some(x=>String(x.iqama||'').trim().toLowerCase()===iqama.toLowerCase())){dup++;return;}
+      if(iqamaClash(iqama,'dependents',null)){dup++;return;}
+      DB.insert('dependents',{depNo:autoDepNo(),employeeId:emp.id,relationship:String(get(['relationship','relation'])||'Other')||'Other',name,iqama,iqamaExpiry:normDate(get(['iqamaexpiry','idexpiry'])),passport:String(get(['passport'])||''),dob:normDate(get(['dateofbirth','dob'])),gender:String(get(['gender'])||''),status:String(get(['status'])||'Active')||'Active'});n++;});
+    refreshBadges();drawDependents();toast(`Imported ${n} dependent(s).${dup?' '+dup+' duplicate ID(s) skipped.':''}${noemp?' '+noemp+' unmatched employee(s) skipped.':''}`,'ok');
+  }catch(err){toast('Import failed: '+err.message,'err');}};
+  r.readAsArrayBuffer(f);input.value='';
+}
+
+/* ============================================================
+   POLICIES (Medical & Life — shared engine)
+   ============================================================ */
+let polFilter={medical:{q:'',status:''},life:{q:'',status:''}};
+function renderPolicies(kind){
+  const cfg=POLICIES[kind];const ff=polFilter[kind];
+  const extraCols=cfg.listExtra.map(c=>`<th class="${c.money?'right':''}">${esc(c.label)}</th>`).join('');
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Insurance</div><h2>${cfg.icon} ${esc(cfg.label)}</h2></div>
+      <div class="actions">
+        ${can('export')?`<button class="btn btn-ghost" onclick="exportPolicies('${kind}')">⬇ Excel</button><button class="btn btn-ghost" onclick="printPolicies('${kind}')">🖨 PDF</button>`:''}
+        ${can('policy.create')?`<button class="btn" onclick="policyForm('${kind}')">+ New ${esc(cfg.short)}</button>`:''}
+      </div></div>
+    <div class="toolbar">
+      <input class="grow" placeholder="🔍 Search policy no, employee, insurer…" value="${esc(ff.q)}" oninput="polFilter['${kind}'].q=this.value;drawPolicies('${kind}')">
+      <select onchange="polFilter['${kind}'].status=this.value;drawPolicies('${kind}')"><option value="">All Statuses</option>${POLICY_STATUSES.map(s=>`<option ${ff.status===s?'selected':''}>${s}</option>`).join('')}</select>
+    </div>
+    <div id="polKpi" class="kpi-grid"></div>
+    <div class="card"><div class="table-wrap"><table>
+      <thead><tr><th>Policy No.</th><th>${esc(cfg.empLabel||'Employee')}</th><th>Insurer</th>${extraCols}<th>Expiry</th><th class="right">Premium</th><th>Status</th><th class="right">Actions</th></tr></thead>
+      <tbody id="polBody"></tbody></table></div></div>`;
+  drawPolicies(kind);
+}
+function filteredPolicies(kind){
+  const cfg=POLICIES[kind];const ff=polFilter[kind];const q=ff.q.toLowerCase();
+  return DB.all(cfg.coll).filter(p=>{
+    if(ff.status&&policyEff(p)!==ff.status)return false;
+    if(q&&![p.policyNo,empName(p.employeeId),refLabel('insuranceCompanies',p.insurer)].join(' ').toLowerCase().includes(q))return false;
+    return true;
+  }).sort((a,b)=>(a.expiryDate||'').localeCompare(b.expiryDate||''));
+}
+function drawPolicies(kind){
+  const cfg=POLICIES[kind];const list=filteredPolicies(kind);const all=DB.all(cfg.coll);
+  const active=all.filter(p=>policyEff(p)==='Active');
+  const expiring=all.filter(p=>policyEff(p)==='Active'&&daysUntil(p.expiryDate)>=0&&daysUntil(p.expiryDate)<=30);
+  const expired=all.filter(p=>policyEff(p)==='Expired');
+  const annual=active.reduce((s,p)=>s+premiumOf(cfg,p),0);
+  document.getElementById('polKpi').innerHTML=`
+    <div class="kpi ok"><div class="v">${active.length}</div><div class="l">Active Policies</div></div>
+    <div class="kpi warn"><div class="v">${expiring.length}</div><div class="l">Expiring ≤30d</div></div>
+    <div class="kpi danger"><div class="v">${expired.length}</div><div class="l">Expired</div></div>
+    <div class="kpi info"><div class="v sm">${num(annual)}</div><div class="l">Active ${cfg.kind==='medical'?'Annual Premium':'Premium'} (SAR)</div></div>`;
+  const body=document.getElementById('polBody');
+  const span=7+cfg.listExtra.length;
+  if(!list.length){body.innerHTML=`<tr><td colspan="${span}" class="empty">No policies match.</td></tr>`;return;}
+  body.innerHTML=list.map(p=>{
+    const es=policyEff(p);const dd=daysUntil(p.expiryDate);
+    let expCell=fmtDate(p.expiryDate);if(es==='Active'&&dd!=null&&dd>=0&&dd<=30)expCell=`${p.expiryDate} <span class="pill ${dd<=7?'red':dd<=15?'amber':'yellow'}">${dd}d</span>`;
+    const extra=cfg.listExtra.map(c=>`<td class="${c.money?'right':''}">${c.money?num(p[c.k]):(esc(p[c.k]||'—'))}</td>`).join('');
+    return `<tr style="cursor:pointer" onclick="renderPolicyDetail('${kind}','${p.id}')">
+      <td><b>${esc(p.policyNo)}</b> ${p.attachments&&p.attachments.length?`<span class="muted">📎${p.attachments.length}</span>`:''}</td>
+      <td>${esc(empName(p.employeeId))||'—'}</td><td>${esc(refLabel('insuranceCompanies',p.insurer))}</td>
+      ${extra}<td>${expCell}</td><td class="right">${num(premiumOf(cfg,p))}</td>
+      <td><span class="pill ${PSTATUS_PILL[es]}">${es}</span></td>
+      <td onclick="event.stopPropagation()"><div class="row-actions">
+        <button class="icon-btn" onclick="renderPolicyDetail('${kind}','${p.id}')" title="Open">👁</button>
+        ${can('policy.edit')?`<button class="icon-btn" onclick="policyForm('${kind}','${p.id}')" title="Edit">✏️</button>`:''}
+        ${isAdmin()?`<button class="icon-btn danger" onclick="deletePolicy('${kind}','${p.id}')" title="Delete">🗑</button>`:''}
+      </div></td></tr>`;
+  }).join('');
+}
+function autoPolicyNo(cfg){const y=new Date().getFullYear();const n=DB.all(cfg.coll).filter(p=>(p.policyNo||'').includes(cfg.prefix+'-'+y)).length+1;return `${cfg.prefix}-${y}-${String(n).padStart(4,'0')}`;}
+function policyForm(kind,id,presetEmp){
+  const cfg=POLICIES[kind];const rec=id?DB.byId(cfg.coll,id):{policyNo:autoPolicyNo(cfg),employeeId:presetEmp||'',effectiveDate:todayISO(),expiryDate:addMonths(todayISO(),12)};
+  const ro=!(id?can('policy.edit'):can('policy.create'));
+  const note=kind==='medical'
+    ?'Policy Number must be unique. Use <b>↺ Auto-Premium</b> to pull the rate from the premium card by the employee\'s grade/class and coverage — the amount stays editable as an override.'
+    :(cfg.optionalEmp?'Policy Number must be unique. Driver/Custodian is optional for vehicle policies.':'Policy Number must be unique. Only <b>active</b> employees can receive new policies.');
+  const btns=ro?[{label:'Close',cls:'btn-ghost',fn:closeModal}]:[{label:'Cancel',cls:'btn-ghost',fn:closeModal}];
+  if(!ro&&kind==='medical')btns.push({label:'↺ Auto-Premium',cls:'btn-ghost',fn:autoMedicalPremium});
+  if(!ro)btns.push({label:id?'Save Changes':'Create',cls:'btn',fn:()=>savePolicy(kind,id)});
+  modal((id?(ro?'View ':'Edit '):'New ')+cfg.short+(id?` — ${esc(rec.policyNo)}`:''),
+    `<div class="form-grid">${cfg.fields.map(f=>`<div class="field ${f.type==='textarea'?'full':''}"><label>${esc(f.label)} ${reqStar(f)}</label>${fieldInput(f,rec[f.k],ro)}</div>`).join('')}</div>
+     <p class="help" style="margin-top:8px;color:var(--muted);font-size:11.5px">${note}</p>`,
+    btns,true);
+}
+function autoMedicalPremium(){
+  const empId=val('ff_employeeId');const cov=val('ff_coverageClass');
+  if(!empId){toast('Select an employee first.','err');return;}
+  const amt=calcMedicalPremium(empId,cov);
+  const el=document.getElementById('ff_annualPremium');if(el)el.value=amt;
+  const cc=document.getElementById('ff_companyContribution');if(cc&&!cc.value)cc.value=amt;
+  const e=DB.byId('employees',empId);
+  toast(`Premium ${num(amt)} from rate card (class ${e&&e.insuranceClass||'B'}). Editable.`,'ok');
+}
+function savePolicy(kind,id){
+  const cfg=POLICIES[kind];const patch={};cfg.fields.forEach(f=>patch[f.k]=readField(f));
+  if(!patch.policyNo){toast('Policy Number is required.','err');return;}
+  if(!cfg.optionalEmp&&!patch.employeeId){toast(cfg.empLabel+' is required.','err');return;}
+  if(!patch.effectiveDate||!patch.expiryDate){toast('Effective and Expiry dates are required.','err');return;}
+  if(patch.expiryDate<patch.effectiveDate){toast('Expiry date precedes effective date.','err');return;}
+  if(DB.all(cfg.coll).some(p=>String(p.policyNo||'').toLowerCase()===patch.policyNo.toLowerCase()&&p.id!==id)){toast('Policy Number already exists.','err');return;}
+  if(!cfg.optionalEmp&&!id){const emp=DB.byId('employees',patch.employeeId);if(!emp||emp.status!=='Active'){toast('Only active employees can receive new policies.','err');return;}}
+  if(id){DB.update(cfg.coll,id,patch);toast('Policy updated.','ok');closeModal();refreshBadges();if(CURRENT==='medical'||CURRENT==='life')drawPolicies(kind);else renderPolicyDetail(kind,id);}
+  else{patch.status='Active';patch.attachments=[];const p=DB.insert(cfg.coll,patch);toast('Policy created.','ok');closeModal();refreshBadges();renderPolicyDetail(kind,p.id);}
+}
+function deletePolicy(kind,id){const cfg=POLICIES[kind];const p=DB.byId(cfg.coll,id);confirmBox('Delete policy',`Delete <b>${esc(p.policyNo)}</b>? Audit history is retained.`,()=>{DB.remove(cfg.coll,id);refreshBadges();drawPolicies(kind);toast('Policy deleted.','ok');});}
+function exportPolicies(kind){
+  const cfg=POLICIES[kind];const rows=DB.all(cfg.coll).map(p=>{const o={'Policy No':p.policyNo,'Employee':empName(p.employeeId),'Insurer':refLabel('insuranceCompanies',p.insurer)};
+    cfg.fields.forEach(f=>{if(['policyNo','employeeId','insurer'].includes(f.k))return;o[f.label]=f.type==='date'?p[f.k]:(f.type==='money'?Number(p[f.k]||0):p[f.k]);});
+    o['Status']=policyEff(p);return o;});
+  sheetDownload(rows,cfg.label,cfg.coll);
+}
+function policiesReport(kind){
+  const cfg=POLICIES[kind];return DB.all(cfg.coll).map(p=>{const o={'Policy No':p.policyNo,'Employee':empName(p.employeeId),'Insurer':refLabel('insuranceCompanies',p.insurer),'Effective':p.effectiveDate,'Expiry':p.expiryDate,'Premium':premiumOf(cfg,p),'Status':policyEff(p)};return o;});}
+function printPolicies(kind){const cfg=POLICIES[kind];printTable(cfg.label,policiesReport(kind));}
+
+/* ---------- policy detail ---------- */
+let polTab='details';
+function renderPolicyDetail(kind,id,tab){
+  const cfg=POLICIES[kind];const p=DB.byId(cfg.coll,id);if(!p){nav(kind);return;}
+  polTab=tab||'details';const es=policyEff(p);
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div>
+      <div class="crumb"><a href="#" onclick="nav('${kind}');return false" style="color:var(--muted)">${esc(cfg.label)}</a> › ${esc(p.policyNo)}</div>
+      <h2>${esc(p.policyNo)} <span class="pill ${PSTATUS_PILL[es]}" style="font-size:12px;vertical-align:middle">${es}</span></h2>
+      <div class="muted">${esc(empName(p.employeeId))} · ${esc(refLabel('insuranceCompanies',p.insurer))}</div>
+    </div>
+    <div class="actions">${policyWorkflowButtons(cfg,p)}${can('policy.edit')?`<button class="btn" onclick="policyForm('${kind}','${p.id}')">✏️ Edit</button>`:''}</div></div>
+    <div class="tabs">
+      ${['details','amortization','documents','history'].map(t=>`<div class="tab ${polTab===t?'active':''}" onclick="renderPolicyDetail('${kind}','${id}','${t}')">${({details:'Details',amortization:'Amortization',documents:'Documents',history:'Change History'})[t]}</div>`).join('')}
+    </div>
+    <div id="pdBody"></div>`;
+  const b=document.getElementById('pdBody');
+  if(polTab==='details')b.innerHTML=policyDetails(cfg,p);
+  if(polTab==='amortization')b.innerHTML=amortizationView(cfg,p);
+  if(polTab==='documents')renderEntityDocs(cfg.coll,p.id,'pdBody',()=>renderPolicyDetail(kind,id,'documents'));
+  if(polTab==='history')b.innerHTML=entityHistory(cfg.coll,p.id);
+}
+/* ---- premium amortization (straight-line, monthly prepaid release) ---- */
+function amortRows(cfg,p){
+  const prem=premiumOf(cfg,p);const start=p.effectiveDate,end=p.expiryDate;
+  if(!start||!end||!prem)return [];
+  const s=new Date(start),e=new Date(end);
+  let months=(e.getFullYear()-s.getFullYear())*12+(e.getMonth()-s.getMonth());if(months<1)months=1;
+  const per=+(prem/months).toFixed(2);const rows=[];let cum=0;
+  for(let i=0;i<months;i++){const dt=addMonths(start,i);let amt=(i===months-1)?+(prem-cum).toFixed(2):per;cum=+(cum+amt).toFixed(2);
+    rows.push({seq:i+1,period:dt.slice(0,7),amount:amt,cumulative:cum,remaining:+(prem-cum).toFixed(2)});}
+  return rows;
+}
+function amortizationView(cfg,p){
+  const rows=amortRows(cfg,p);const prem=premiumOf(cfg,p);
+  const elapsed=rows.filter(r=>r.period<=todayISO().slice(0,7));
+  const expensed=elapsed.length?elapsed[elapsed.length-1].cumulative:0;
+  if(!rows.length)return `<div class="card"><div class="empty">No amortization — set premium, effective and expiry dates.</div></div>`;
+  return `<div class="kpi-grid">
+    <div class="kpi"><div class="v sm">${num(prem)}</div><div class="l">Total Premium (SAR)</div></div>
+    <div class="kpi muted"><div class="v sm">${rows.length}</div><div class="l">Months</div></div>
+    <div class="kpi ok"><div class="v sm">${num(expensed)}</div><div class="l">Expensed to Date</div></div>
+    <div class="kpi warn"><div class="v sm">${num(+(prem-expensed).toFixed(2))}</div><div class="l">Prepaid Remaining</div></div>
+  </div>
+  <div class="card"><div class="card-h">Monthly Amortization Schedule <span class="sub">straight-line over policy term</span>
+    ${can('export')?`<button class="btn btn-sm btn-ghost" onclick="exportAmort('${cfg.kind}','${p.id}')">⬇ Excel</button>`:''}</div>
+    <div class="table-wrap"><table><thead><tr><th>#</th><th>Period</th><th class="right">Monthly Charge</th><th class="right">Cumulative</th><th class="right">Prepaid Remaining</th></tr></thead>
+    <tbody>${rows.map(r=>{const past=r.period<=todayISO().slice(0,7);return `<tr><td>${r.seq}</td><td>${r.period} ${past?'<span class="pill green">posted</span>':'<span class="pill grey">future</span>'}</td><td class="right">${num(r.amount)}</td><td class="right">${num(r.cumulative)}</td><td class="right">${num(r.remaining)}</td></tr>`;}).join('')}</tbody></table></div></div>`;
+}
+function exportAmort(kind,id){const cfg=POLICIES[kind];const p=DB.byId(cfg.coll,id);const rows=amortRows(cfg,p).map(r=>({'#':r.seq,'Period':r.period,'Monthly Charge SAR':r.amount,'Cumulative SAR':r.cumulative,'Prepaid Remaining SAR':r.remaining}));sheetDownload(rows,'Amortization '+p.policyNo,'amort_'+p.policyNo);}
+function policyDetails(cfg,p){
+  const dd=daysUntil(p.expiryDate);
+  const left=cfg.fields.map(f=>{
+    let v;if(f.type==='ref')v=esc(refLabel(f.ref,p[f.k]));else if(f.type==='empref')v=esc(empName(p[f.k]));else if(f.type==='money')v=p[f.k]?money(p[f.k]):'—';else v=esc(p[f.k]);
+    return kv(f.label,v);
+  }).join('');
+  return `<div class="grid2">
+    <div class="card"><div class="card-h">Policy Information</div><div class="card-b">${left}
+      ${kv('Days to Expiry',dd==null?'—':(dd<0?'<span class="pill red">Expired</span>':dd+' days'))}
+      ${kv('Status',`<span class="pill ${PSTATUS_PILL[policyEff(p)]}">${policyEff(p)}</span>`)}
+    </div></div>
+    <div class="card"><div class="card-h">${esc(cfg.empLabel||'Employee')}</div><div class="card-b">
+      ${(()=>{const e=DB.byId('employees',p.employeeId);if(!e)return '<div class="empty">'+(cfg.optionalEmp?'No '+(cfg.empLabel||'employee').toLowerCase()+' linked.':'Employee not found.')+'</div>';
+        return kv('Name',esc(e.name))+kv('Employee No.',esc(e.empNo))+kv('Iqama / ID',esc(e.iqama))+kv('Insurance Class',esc(e.insuranceClass))+kv('Division',esc(refLabel('divisions',e.division)))+kv('Status',e.status)+`<div style="margin-top:10px"><a href="#" onclick="renderEmployeeDetail('${e.id}');return false" class="btn btn-sm btn-ghost">Open employee →</a></div>`;})()}
+    </div></div>
+  </div>`;
+}
+function policyWorkflowButtons(cfg,p){
+  const s=p.status;const b=[];const k=cfg.kind;
+  const act=(label,cls,action)=>`<button class="btn btn-sm ${cls}" onclick="policyWf('${k}','${p.id}','${action}')">${label}</button>`;
+  if(s==='Active'&&can('policy.suspend'))b.push(act('Suspend','btn-warn','suspend'));
+  if(s==='Suspended'&&can('policy.suspend'))b.push(act('Reactivate','btn-ok','reactivate'));
+  if(['Active','Expired'].includes(policyEff(p))&&can('policy.renew'))b.push(act('Renew','','renew'));
+  if(['Active','Suspended'].includes(s)&&can('policy.cancel'))b.push(act('Cancel','btn-danger','cancel'));
+  return b.join(' ');
+}
+function policyWf(kind,id,action){
+  const cfg=POLICIES[kind];const p=DB.byId(cfg.coll,id);
+  if(action==='renew')return renewPolicy(kind,p);
+  const map={suspend:'Suspended',reactivate:'Active',cancel:'Cancelled'};
+  const confirmAct=action==='cancel';
+  const go=()=>{DB.update(cfg.coll,id,{status:map[action]});refreshBadges();closeModal();renderPolicyDetail(kind,id,polTab);toast('Policy '+map[action].toLowerCase()+'.','ok');};
+  if(confirmAct)confirmBox('Cancel policy',`Cancel <b>${esc(p.policyNo)}</b>? This marks the policy Cancelled.`,go);else go();
+}
+function renewPolicy(kind,p){
+  const cfg=POLICIES[kind];
+  modal('Renew Policy',`<p>Create a renewal of <b>${esc(p.policyNo)}</b> as a new active policy. The current policy will be marked <b>Renewed</b>.</p>
+    <div class="form-grid" style="margin-top:12px">
+      <div class="field"><label>New Policy Number</label><input id="ff_np" value="${esc(p.policyNo)}-R"></div>
+      <div class="field"><label>New Effective Date</label><input id="ff_ns" type="date" value="${esc(addDay(p.expiryDate,1))}"></div>
+      <div class="field"><label>New Expiry Date</label><input id="ff_ne" type="date" value="${esc(addMonths(addDay(p.expiryDate,1),12))}"></div>
+      <div class="field"><label>${cfg.kind==='medical'?'Annual Premium':'Premium'} (SAR)</label><input id="ff_npr" type="number" step="any" value="${premiumOf(cfg,p)}"></div>
+    </div>`,[{label:'Cancel',cls:'btn-ghost',fn:closeModal},{label:'Create Renewal',cls:'btn',fn:()=>{
+      const np=val('ff_np').trim();
+      if(!np){toast('New policy number required.','err');return;}
+      if(DB.all(cfg.coll).some(x=>String(x.policyNo||'').toLowerCase()===np.toLowerCase())){toast('Policy Number already exists.','err');return;}
+      const copy=clone(p);delete copy.id;delete copy._createdAt;delete copy._updatedAt;
+      copy.policyNo=np;copy.status='Active';copy.effectiveDate=val('ff_ns');copy.expiryDate=val('ff_ne');copy[cfg.premiumKey]=Number(val('ff_npr')||0);copy.attachments=[];
+      const nc=DB.insert(cfg.coll,copy);
+      DB.update(cfg.coll,p.id,{status:'Renewed'});
+      closeModal();refreshBadges();renderPolicyDetail(kind,nc.id);toast('Renewal created.','ok');
+    }}]);
+}
+
+/* ============================================================
+   DOCUMENTS
+   ============================================================ */
+const DOC_CATS=['Insurance Card','Policy Certificate','Employee Declaration','Dependent Document','Iqama Copy','Other'];
+function renderEntityDocs(coll,id,mountId,refresh){
+  const rec=DB.byId(coll,id);const docs=rec.attachments||[];
+  document.getElementById(mountId).innerHTML=`<div class="card"><div class="card-h">Documents <span class="sub">${docs.length} file(s)</span>
+    ${can('document.manage')?`<button class="btn btn-sm" onclick="document.getElementById('edoc').click()">📎 Upload</button><input type="file" id="edoc" class="hidden" multiple onchange="uploadEntityDocs('${coll}','${id}',this)">`:''}</div>
+    <div class="card-b">
+    ${docs.length?docs.map((dx,i)=>{const exp=dx.expiry?daysUntil(dx.expiry):null;return `<div class="att-item">
+      <span>${dx.type&&dx.type.includes('pdf')?'📕':dx.type&&dx.type.includes('image')?'🖼️':'📄'}</span>
+      <span class="grow"><b>${esc(dx.name)}</b><br><span class="muted" style="font-size:11.5px">${esc(dx.category||'Document')}${dx.expiry?' · expires '+dx.expiry+(exp!=null&&exp<0?' (EXPIRED)':exp!=null&&exp<=30?` (${exp}d)`:''):''} · ${(dx.size/1024).toFixed(0)} KB</span></span>
+      ${dx.data&&dx.data!=='#'?`<a href="${dx.data}" download="${esc(dx.name)}" class="icon-btn">⬇</a>`:''}
+      ${can('document.manage')?`<button class="icon-btn" onclick="editEntityDocMeta('${coll}','${id}',${i})">✏️</button><button class="icon-btn danger" onclick="removeEntityDoc('${coll}','${id}',${i})">✕</button>`:''}
+    </div>`;}).join(''):'<div class="empty">No documents attached.</div>'}
+    </div></div>`;
+  window._docRefresh=refresh;
+}
+function uploadEntityDocs(coll,id,input){
+  const rec=DB.byId(coll,id);const docs=(rec.attachments||[]).slice();let pending=input.files.length;
+  [...input.files].forEach(f=>{if(f.size>3*1024*1024){toast(`"${f.name}" >3MB skipped.`,'err');pending--;return;}
+    const r=new FileReader();r.onload=()=>{docs.push({name:f.name,size:f.size,type:f.type,data:r.result,category:coll==='employees'?'Employee Declaration':'Policy Certificate',expiry:'',uploadedAt:nowISO(),uploadedBy:SESSION.username});pending--;if(pending<=0){DB.update(coll,id,{attachments:docs});refreshBadges();if(window._docRefresh)window._docRefresh();toast('Document(s) uploaded.','ok');}};r.readAsDataURL(f);});
+  input.value='';
+}
+function editEntityDocMeta(coll,id,i){
+  const rec=DB.byId(coll,id);const dx=rec.attachments[i];
+  modal('Document — '+dx.name,`<div class="form-grid">
+    <div class="field"><label>Category</label><select id="ff_cat">${DOC_CATS.map(x=>`<option ${dx.category===x?'selected':''}>${x}</option>`).join('')}</select></div>
+    <div class="field"><label>Expiry Date (optional)</label><input id="ff_exp" type="date" value="${esc(dx.expiry||'')}"></div>
+  </div>`,[{label:'Cancel',cls:'btn-ghost',fn:closeModal},{label:'Save',cls:'btn',fn:()=>{const a=rec.attachments.slice();a[i]=Object.assign({},dx,{category:val('ff_cat'),expiry:val('ff_exp')});DB.update(coll,id,{attachments:a});closeModal();if(window._docRefresh)window._docRefresh();toast('Document updated.','ok');}}]);
+}
+function removeEntityDoc(coll,id,i){const rec=DB.byId(coll,id);confirmBox('Remove document',`Remove <b>${esc(rec.attachments[i].name)}</b>?`,()=>{const a=rec.attachments.slice();a.splice(i,1);DB.update(coll,id,{attachments:a});refreshBadges();if(window._docRefresh)window._docRefresh();});}
+
+function allDocuments(){
+  const out=[];
+  DB.all('employees').forEach(e=>(e.attachments||[]).forEach((d,i)=>out.push({owner:e.name,ownerType:'Employee',coll:'employees',id:e.id,d,i})));
+  DB.all('medPolicies').forEach(p=>(p.attachments||[]).forEach((d,i)=>out.push({owner:p.policyNo,ownerType:'Medical Policy',coll:'medPolicies',id:p.id,d,i})));
+  DB.all('lifePolicies').forEach(p=>(p.attachments||[]).forEach((d,i)=>out.push({owner:p.policyNo,ownerType:'Life Policy',coll:'lifePolicies',id:p.id,d,i})));
+  DB.all('vehiclePolicies').forEach(p=>(p.attachments||[]).forEach((d,i)=>out.push({owner:p.policyNo,ownerType:'Vehicle Policy',coll:'vehiclePolicies',id:p.id,d,i})));
+  return out.sort((a,b)=>(b.d.uploadedAt||'').localeCompare(a.d.uploadedAt||''));
+}
+function renderDocuments(){
+  const all=allDocuments();
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Records</div><h2>📎 Documents</h2></div></div>
+    <div class="kpi-grid">
+      <div class="kpi"><div class="v">${all.length}</div><div class="l">Total Documents</div></div>
+      <div class="kpi danger"><div class="v">${all.filter(x=>x.d.expiry&&daysUntil(x.d.expiry)<0).length}</div><div class="l">Expired</div></div>
+      <div class="kpi warn"><div class="v">${all.filter(x=>x.d.expiry&&daysUntil(x.d.expiry)>=0&&daysUntil(x.d.expiry)<=30).length}</div><div class="l">Expiring ≤30d</div></div>
+      <div class="kpi muted"><div class="v">${DB.all('medPolicies').concat(DB.all('lifePolicies')).concat(DB.all('vehiclePolicies')).filter(p=>!(p.attachments||[]).length&&policyEff(p)==='Active').length}</div><div class="l">Active Policies w/o Docs</div></div>
+    </div>
+    <div class="card"><div class="card-h">Document Register</div><div class="table-wrap"><table>
+      <thead><tr><th>Document</th><th>Category</th><th>Attached To</th><th>Type</th><th>Uploaded</th><th>Expiry</th><th class="right">Action</th></tr></thead>
+      <tbody>${all.length?all.map(({owner,ownerType,coll,id,d,i})=>{const exp=d.expiry?daysUntil(d.expiry):null;return `<tr>
+        <td>${d.type&&d.type.includes('pdf')?'📕':d.type&&d.type.includes('image')?'🖼️':'📄'} ${esc(d.name)}</td>
+        <td><span class="pill grey">${esc(d.category||'Document')}</span></td>
+        <td><a href="#" onclick="${coll==='employees'?`renderEmployeeDetail('${id}','documents')`:`renderPolicyDetail('${coll==='medPolicies'?'medical':coll==='vehiclePolicies'?'vehicle':'life'}','${id}','documents')`};return false">${esc(owner)}</a></td>
+        <td class="muted">${esc(ownerType)}</td>
+        <td class="muted">${d.uploadedAt?new Date(d.uploadedAt).toLocaleDateString():'—'}</td>
+        <td>${d.expiry?(exp<0?`<span class="pill red">Expired</span>`:exp<=30?`<span class="pill amber">${exp}d</span>`:d.expiry):'—'}</td>
+        <td class="right">${d.data&&d.data!=='#'?`<a href="${d.data}" download="${esc(d.name)}" class="icon-btn">⬇</a>`:'—'}</td></tr>`;}).join(''):`<tr><td colspan="7" class="empty">No documents uploaded. Attach files from any employee or policy Documents tab.</td></tr>`}</tbody></table></div></div>`;
+}
+
+/* ============================================================
+   ALERTS / NOTIFICATIONS
+   ============================================================ */
+function computeNotifications(){
+  const out=[];const rd=getSettings().reminderDays||[90,60,30,15,7];const maxR=Math.max.apply(null,rd);
+  const policyAlerts=(kind)=>{const cfg=POLICIES[kind];DB.all(cfg.coll).forEach(p=>{const es=policyEff(p);const who=empName(p.employeeId)||p.vehicleMake||p.policyNo;
+    if(es==='Active'){const d=daysUntil(p.expiryDate);
+      if(d!=null&&d>=0&&d<=maxR)out.push({icon:cfg.icon,sev:d<=7?'high':d<=30?'med':'low',title:`${cfg.short} ${p.policyNo} expires in ${d} day(s)`,sub:who,kind,pid:p.id});
+      if(!(p.attachments||[]).length)out.push({icon:'📄',sev:'low',title:`Missing documents — ${p.policyNo}`,sub:`${cfg.short} · ${who}`,kind,pid:p.id});}
+    if(es==='Expired')out.push({icon:cfg.icon,sev:'high',title:`${cfg.short} expired — ${p.policyNo}`,sub:`${who} · ${p.expiryDate}`,kind,pid:p.id});
+  });};
+  POLICY_KINDS.forEach(policyAlerts);
+  DB.all('employees').forEach(e=>{if(e.iqamaExpiry){const d=daysUntil(e.iqamaExpiry);if(d!=null&&d<=30)out.push({icon:'🪪',sev:d<0?'high':'med',title:`Employee Iqama ${d<0?'expired':'expiring'} — ${e.empNo}`,sub:`${e.name} · ${e.iqamaExpiry}`,eid:e.id});}});
+  DB.all('dependents').forEach(dp=>{if(dp.iqamaExpiry){const d=daysUntil(dp.iqamaExpiry);if(d!=null&&d<=30)out.push({icon:'🪪',sev:d<0?'high':'med',title:`Dependent Iqama ${d<0?'expired':'expiring'} — ${dp.name}`,sub:`${empName(dp.employeeId)} · ${dp.iqamaExpiry}`,eid:dp.employeeId});}});
+  const order={high:0,med:1,low:2};return out.sort((a,b)=>order[a.sev]-order[b.sev]);
+}
+function renderNotifications(){
+  const n=computeNotifications();
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Overview</div><h2>🔔 Alerts</h2></div>
+      <div class="actions">${can('settings.manage')?`<button class="btn btn-ghost" onclick="nav('settings')">⚙️ Reminder settings</button>`:''}</div></div>
+    <div class="kpi-grid">
+      <div class="kpi danger"><div class="v">${n.filter(x=>x.sev==='high').length}</div><div class="l">Critical</div></div>
+      <div class="kpi warn"><div class="v">${n.filter(x=>x.sev==='med').length}</div><div class="l">Warning</div></div>
+      <div class="kpi muted"><div class="v">${n.filter(x=>x.sev==='low').length}</div><div class="l">Info</div></div>
+    </div>
+    <div class="card"><div class="card-b">
+      ${n.length?n.map(x=>`<div class="notif-row">
+        <div class="notif-ico" style="background:${x.sev==='high'?'#fbe5e2':x.sev==='med'?'#fdeede':'#eef1f4'}">${x.icon}</div>
+        <div class="grow"><b>${esc(x.title)}</b><br><span class="muted" style="font-size:12px">${esc(x.sub||'')}</span></div>
+        ${x.pid?`<button class="btn btn-xs btn-ghost" onclick="renderPolicyDetail('${x.kind}','${x.pid}')">Open</button>`:x.eid?`<button class="btn btn-xs btn-ghost" onclick="renderEmployeeDetail('${x.eid}')">Open</button>`:''}
+      </div>`).join(''):'<div class="empty">✅ All clear — no active alerts.</div>'}
+    </div></div>`;
+}
+
+/* ============================================================
+   DASHBOARD
+   ============================================================ */
+function renderDashboard(){
+  const emps=DB.all('employees');const deps=DB.all('dependents');
+  const med=DB.all('medPolicies');const life=DB.all('lifePolicies');const veh=DB.all('vehiclePolicies');
+  const allPol=med.map(p=>({p,cfg:POLICIES.medical})).concat(life.map(p=>({p,cfg:POLICIES.life}))).concat(veh.map(p=>({p,cfg:POLICIES.vehicle})));
+  const activeMed=med.filter(p=>policyEff(p)==='Active');
+  const activeLife=life.filter(p=>policyEff(p)==='Active');
+  const activeVeh=veh.filter(p=>policyEff(p)==='Active');
+  const expiring=allPol.filter(({p})=>{const d=daysUntil(p.expiryDate);return policyEff(p)==='Active'&&d!=null&&d>=0&&d<=30;});
+  const expired=allPol.filter(({p})=>policyEff(p)==='Expired');
+  const pendingRenewals=allPol.filter(({p})=>{const d=daysUntil(p.expiryDate);return policyEff(p)==='Active'&&d!=null&&d>=0&&d<=90;});
+  const annualCost=activeMed.reduce((s,p)=>s+Number(p.annualPremium||0),0)+activeLife.reduce((s,p)=>s+Number(p.premium||0),0)+activeVeh.reduce((s,p)=>s+Number(p.premium||0),0);
+  const companyCost=activeMed.reduce((s,p)=>s+Number(p.companyContribution||0),0);
+  // cost by division
+  const byDiv={};const byInsurer={};
+  const addCost=(p,prem)=>{const k=refLabel('divisions',empDivision(p.employeeId))||'—';byDiv[k]=(byDiv[k]||0)+prem;const ins=refLabel('insuranceCompanies',p.insurer)||'—';byInsurer[ins]=(byInsurer[ins]||0)+prem;};
+  activeMed.forEach(p=>addCost(p,Number(p.annualPremium||0)));
+  activeLife.forEach(p=>addCost(p,Number(p.premium||0)));
+  activeVeh.forEach(p=>addCost(p,Number(p.premium||0)));
+  const maxDiv=Math.max(1,...Object.values(byDiv));const maxIns=Math.max(1,...Object.values(byInsurer));
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Welcome, ${esc(SESSION.name)}</div><h2>📊 Dashboard</h2></div></div>
+    <div class="kpi-grid">
+      <div class="kpi"><div class="v">${emps.length}</div><div class="l">Total Employees</div></div>
+      <div class="kpi info"><div class="v">${deps.length}</div><div class="l">Total Dependents</div></div>
+      <div class="kpi ok"><div class="v">${activeMed.length}</div><div class="l">Active Medical Policies</div></div>
+      <div class="kpi ok"><div class="v">${activeLife.length}</div><div class="l">Active Life Policies</div></div>
+      <div class="kpi ok"><div class="v">${activeVeh.length}</div><div class="l">Active Vehicle Policies</div></div>
+      <div class="kpi warn"><div class="v">${expiring.length}</div><div class="l">Expiring ≤30 Days</div></div>
+      <div class="kpi danger"><div class="v">${expired.length}</div><div class="l">Expired Policies</div></div>
+      <div class="kpi purple"><div class="v">${pendingRenewals.length}</div><div class="l">Pending Renewals</div></div>
+      <div class="kpi"><div class="v sm">${num(annualCost)}</div><div class="l">Annual Premium (SAR)</div></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><div class="card-h">🔔 Top Alerts <a href="#" onclick="nav('notifications');return false" style="font-size:12px;font-weight:500">View all</a></div><div class="card-b" id="dashAlerts"></div></div>
+      <div class="card"><div class="card-h">Insurance Cost by Division <span class="sub">active, annual SAR</span></div><div class="card-b">${barChart(byDiv,maxDiv,true)}</div></div>
+      <div class="card"><div class="card-h">Cost by Insurance Company <span class="sub">active, annual SAR</span></div><div class="card-b">${barChart(byInsurer,maxIns,true)}</div></div>
+      <div class="card"><div class="card-h">Upcoming Renewals <span class="sub">next 90 days</span></div><div class="card-b">${pendingRenewals.length?pendingRenewals.sort((a,b)=>(a.p.expiryDate||'').localeCompare(b.p.expiryDate||'')).slice(0,8).map(({p,cfg})=>`<div class="bar-row"><div class="top"><a href="#" onclick="renderPolicyDetail('${cfg.kind}','${p.id}');return false">${cfg.icon} ${esc(p.policyNo)} — ${esc(empName(p.employeeId))}</a><span class="muted">${daysUntil(p.expiryDate)}d</span></div></div>`).join(''):'<div class="muted">None in next 90 days.</div>'}</div></div>
+    </div>
+    <div class="grid3">
+      <div class="kpi muted"><div class="v sm">${num(companyCost)}</div><div class="l">Company Contribution (Medical, SAR)</div></div>
+      <div class="kpi muted"><div class="v sm">${num(activeMed.reduce((s,p)=>s+Number(p.employeeContribution||0),0))}</div><div class="l">Employee Contribution (Medical, SAR)</div></div>
+      <div class="kpi muted"><div class="v sm">${num(activeLife.reduce((s,p)=>s+Number(p.sumAssured||0),0))}</div><div class="l">Total Life Sum Assured (SAR)</div></div>
+    </div>`;
+  const al=computeNotifications().slice(0,7);
+  document.getElementById('dashAlerts').innerHTML=al.length?al.map(x=>`<div class="bar-row"><div class="top"><span>${x.icon} ${esc(x.title)}</span><span class="pill ${x.sev==='high'?'red':x.sev==='med'?'amber':'grey'}">${x.sev}</span></div></div>`).join(''):'<div class="muted">No alerts.</div>';
+}
+function barChart(obj,max,isMoney){const ent=Object.entries(obj).sort((a,b)=>b[1]-a[1]);if(!ent.length)return '<div class="muted">No data.</div>';return ent.map(([k,v])=>`<div class="bar-row"><div class="top"><span>${esc(k)}</span><span class="muted">${isMoney?num(v):v}</span></div><div class="bar-track"><div class="bar-fill" style="width:${max?Math.round(v/max*100):0}%"></div></div></div>`).join('');}
+
+/* ============================================================
+   PREMIUM RATES
+   ============================================================ */
+function renderPremiumRates(){
+  const card=getRateCard();const editable=can('master.edit');
+  const head=`<tr><th>Member Type \\ Class</th>${CLASSES.map(c=>`<th class="center">${esc(c.grade)}<br><b>${esc(c.code)}</b> · <span class="muted">${esc(c.network)}</span></th>`).join('')}</tr>`;
+  const body=MEMBER_TYPES.map((mt,mi)=>`<tr><td><b>${esc(mt)}</b></td>${CLASSES.map(c=>{const v=(card.rates[mt]&&card.rates[mt][c.code])||0;return `<td class="right">${editable?`<input id="rate_${mi}_${esc(c.code)}" type="number" step="any" value="${v}" style="width:92px;padding:5px 7px;border:1px solid var(--line);border-radius:6px;text-align:right">`:num(v)}</td>`;}).join('')}</tr>`).join('');
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Configuration</div><h2>💲 Premium Rates</h2></div>
+      <div class="actions">
+        ${can('export')?`<button class="btn btn-ghost" onclick="exportRates()">⬇ Excel</button>`:''}
+        ${editable&&can('import')?`<button class="btn btn-ghost" onclick="document.getElementById('impR').click()">⬆ Import</button><input type="file" id="impR" class="hidden" accept=".xlsx,.xls,.csv" onchange="importRates(this)">`:''}
+        ${editable?`<button class="btn" onclick="saveRates()">💾 Save Rates</button>`:''}
+      </div></div>
+    <div class="toolbar">
+      <label class="muted" style="display:flex;align-items:center;gap:6px">Rate Year <input id="rateYear" type="number" value="${esc(card.year||new Date().getFullYear())}" style="width:90px;padding:7px 9px;border:1px solid var(--line);border-radius:7px" ${editable?'':'disabled'}></label>
+    </div>
+    <div class="card"><div class="card-h">Agreed Annual Premium Rate Card <span class="sub">SAR per member / year · classes map to employee grade bands</span></div>
+      <div class="table-wrap"><table><thead>${head}</thead><tbody>${body}</tbody></table></div></div>
+    <p class="muted" style="font-size:12px">Each class maps to a grade band (e.g. GEN 19+ → VIP / NW7). The medical policy form's <b>↺ Auto-Premium</b> reads these rates by the employee's class and coverage scope, summing employee + dependents — and the amount stays editable as an override.</p>`;
+}
+function saveRates(){
+  if(!can('master.edit'))return;
+  const card=clone(getRateCard());card.rates=card.rates||{};
+  MEMBER_TYPES.forEach((mt,mi)=>{card.rates[mt]=card.rates[mt]||{};CLASSES.forEach(c=>{const el=document.getElementById('rate_'+mi+'_'+c.code);if(el)card.rates[mt][c.code]=Number(el.value||0);});});
+  const yr=Number(val('rateYear'))||card.year;
+  if(DB.byId('premiumRates','card'))DB.update('premiumRates','card',{rates:card.rates,year:yr});else DB.insert('premiumRates',{id:'card',year:yr,rates:card.rates});
+  toast('Premium rates saved.','ok');
+}
+function exportRates(){const card=getRateCard();const rows=MEMBER_TYPES.map(mt=>{const o={'Member Type':mt};CLASSES.forEach(c=>o[c.code+' ('+c.network+')']=(card.rates[mt]&&card.rates[mt][c.code])||0);return o;});sheetDownload(rows,'Premium Rates','premium_rates');}
+function importRates(input){
+  const f=input.files[0];if(!f)return;const r=new FileReader();
+  r.onload=e=>{try{
+    const wb=XLSX.read(e.target.result,{type:'array'});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
+    const card=clone(getRateCard());card.rates=card.rates||{};let n=0;
+    rows.forEach(row=>{let mt='';for(const k in row){const kk=k.toLowerCase();if(kk.includes('member')){mt=String(row[k]).trim();break;}}
+      if(!mt)return;const match=MEMBER_TYPES.find(x=>x.toLowerCase()===mt.toLowerCase());if(!match)return;card.rates[match]=card.rates[match]||{};
+      CLASSES.forEach(c=>{for(const k in row){const ku=k.toUpperCase();if(ku===c.code||ku.startsWith(c.code+' ')||ku.startsWith(c.code+'(')||ku.includes('('+c.network+')')||ku===c.network){const v=Number(String(row[k]).replace(/[^\d.]/g,''));if(!isNaN(v))card.rates[match][c.code]=v;}}});n++;});
+    if(DB.byId('premiumRates','card'))DB.update('premiumRates','card',{rates:card.rates});else DB.insert('premiumRates',{id:'card',year:card.year,rates:card.rates});
+    renderPremiumRates();toast(`Imported rates for ${n} member type(s).`,'ok');
+  }catch(err){toast('Import failed: '+err.message,'err');}};
+  r.readAsArrayBuffer(f);input.value='';
+}
+
+/* ============================================================
+   REPORTS
+   ============================================================ */
+const REPORTS=[
+  {key:'empRegister',name:'Employee Insurance Register',build:()=>DB.all('employees').map(e=>{const med=DB.all('medPolicies').filter(p=>p.employeeId===e.id&&policyEff(p)==='Active');const life=DB.all('lifePolicies').filter(p=>p.employeeId===e.id&&policyEff(p)==='Active');return {'Emp No':e.empNo,'Name':e.name,'Iqama / ID':e.iqama,'Division':refLabel('divisions',e.division),'Status':e.status,'Dependents':DB.all('dependents').filter(d=>d.employeeId===e.id).length,'Active Medical':med.length,'Active Life':life.length,'Annual Premium SAR':med.reduce((s,p)=>s+Number(p.annualPremium||0),0)+life.reduce((s,p)=>s+Number(p.premium||0),0)};})},
+  {key:'depRegister',name:'Dependent Register',build:()=>DB.all('dependents').map(d=>({'Dep No':d.depNo,'Name':d.name,'Relationship':d.relationship,'Employee':empName(d.employeeId),'Iqama / ID':d.iqama,'Iqama Expiry':d.iqamaExpiry,'Status':d.status}))},
+  {key:'activePolicies',name:'Active Policies',build:()=>{const out=[];POLICY_KINDS.forEach(kind=>{const cfg=POLICIES[kind];DB.all(cfg.coll).filter(p=>policyEff(p)==='Active').forEach(p=>out.push({'Type':cfg.short.replace(' Policy',''),'Policy No':p.policyNo,'Employee / Driver':empName(p.employeeId)||p.vehicleMake||'—','Insurer':refLabel('insuranceCompanies',p.insurer),'Effective':p.effectiveDate,'Expiry':p.expiryDate,'Premium SAR':premiumOf(cfg,p)}));});return out;}},
+  {key:'expiredPolicies',name:'Expired Policies',build:()=>{const out=[];POLICY_KINDS.forEach(kind=>{const cfg=POLICIES[kind];DB.all(cfg.coll).filter(p=>policyEff(p)==='Expired').forEach(p=>out.push({'Type':cfg.short.replace(' Policy',''),'Policy No':p.policyNo,'Employee / Driver':empName(p.employeeId)||p.vehicleMake||'—','Insurer':refLabel('insuranceCompanies',p.insurer),'Expired On':p.expiryDate}));});return out;}},
+  {key:'renewals',name:'Renewal Report (90d)',build:()=>{const out=[];POLICY_KINDS.forEach(kind=>{const cfg=POLICIES[kind];DB.all(cfg.coll).forEach(p=>{const d=daysUntil(p.expiryDate);if(policyEff(p)==='Active'&&d>=0&&d<=90)out.push({'Type':cfg.short.replace(' Policy',''),'Policy No':p.policyNo,'Employee / Driver':empName(p.employeeId)||p.vehicleMake||'—','Insurer':refLabel('insuranceCompanies',p.insurer),'Expiry':p.expiryDate,'Days Left':d,'Premium SAR':premiumOf(cfg,p)});});});return out.sort((a,b)=>a['Days Left']-b['Days Left']);}},
+  {key:'costDivision',name:'Insurance Cost by Division',build:()=>{const o={};const add=(p,prem)=>{const k=refLabel('divisions',empDivision(p.employeeId))||'—';o[k]=o[k]||{Division:k,Policies:0,'Annual Cost SAR':0};o[k].Policies++;o[k]['Annual Cost SAR']+=prem;};DB.all('medPolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.annualPremium||0)));DB.all('lifePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));DB.all('vehiclePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));return Object.values(o);}},
+  {key:'costBU',name:'Insurance Cost by Business Unit',build:()=>{const o={};const add=(p,prem)=>{const k=refLabel('businessUnits',empBusinessUnit(p.employeeId))||'—';o[k]=o[k]||{'Business Unit':k,Policies:0,'Annual Cost SAR':0};o[k].Policies++;o[k]['Annual Cost SAR']+=prem;};DB.all('medPolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.annualPremium||0)));DB.all('lifePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));DB.all('vehiclePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));return Object.values(o);}},
+  {key:'costCompany',name:'Insurance Cost by Company',build:()=>{const o={};const add=(p,prem)=>{const k=refLabel('companies',empCompany(p.employeeId))||'—';o[k]=o[k]||{Company:k,Policies:0,'Annual Cost SAR':0};o[k].Policies++;o[k]['Annual Cost SAR']+=prem;};DB.all('medPolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.annualPremium||0)));DB.all('lifePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));DB.all('vehiclePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));return Object.values(o);}},
+  {key:'costInsurer',name:'Cost by Insurance Company',build:()=>{const o={};const add=(p,prem)=>{const k=refLabel('insuranceCompanies',p.insurer)||'—';o[k]=o[k]||{Insurer:k,Policies:0,'Annual Cost SAR':0};o[k].Policies++;o[k]['Annual Cost SAR']+=prem;};DB.all('medPolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.annualPremium||0)));DB.all('lifePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));DB.all('vehiclePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));return Object.values(o);}},
+  {key:'amortSummary',name:'Premium Amortization Summary',build:()=>{const out=[];POLICY_KINDS.forEach(kind=>{const cfg=POLICIES[kind];DB.all(cfg.coll).filter(p=>policyEff(p)==='Active').forEach(p=>{const rows=amortRows(cfg,p);if(!rows.length)return;const elapsed=rows.filter(r=>r.period<=todayISO().slice(0,7));const expensed=elapsed.length?elapsed[elapsed.length-1].cumulative:0;out.push({'Type':cfg.short.replace(' Policy',''),'Policy No':p.policyNo,'Holder':empName(p.employeeId)||p.vehicleMake||'—','Premium SAR':premiumOf(cfg,p),'Months':rows.length,'Monthly SAR':rows[0].amount,'Expensed to Date SAR':expensed,'Prepaid Remaining SAR':+(premiumOf(cfg,p)-expensed).toFixed(2)});});});return out;}},
+  {key:'rateCard',name:'Premium Rate Card',build:()=>{const c=getRateCard();return MEMBER_TYPES.map(mt=>{const o={'Member Type':mt};CLASSES.forEach(cl=>o[cl.code+' / '+cl.network]=(c.rates[mt]&&c.rates[mt][cl.code])||0);return o;});}},
+  {key:'audit',name:'Audit Log',build:()=>DB.all('audit').slice().reverse().map(a=>({Timestamp:new Date(a.ts).toLocaleString(),User:a.user,Role:a.role,Action:a.action,Entity:a.entity,Record:a.recordLabel,Changes:(a.changes||[]).map(c=>`${c.field}: ${fmtChange(c.old)}→${fmtChange(c.new)}`).join('; ')}))}
+];
+let currentReport=null;
+function renderReports(){
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Operations</div><h2>📈 Reports</h2></div></div>
+    <div class="card"><div class="card-b"><div class="hub-grid">
+      ${REPORTS.map(r=>`<div class="hub-card" onclick="openReport('${r.key}')"><div class="hc-ico">📄</div><div class="hc-name">${esc(r.name)}</div><div class="hc-count">${r.build().length} row(s)</div></div>`).join('')}
+    </div></div></div>`;
+}
+function openReport(key){
+  const rep=REPORTS.find(r=>r.key===key);const rows=rep.build();currentReport={rep,rows};
+  const cols=rows.length?Object.keys(rows[0]):[];
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb"><a href="#" onclick="nav('reports');return false" style="color:var(--muted)">Reports</a> › ${esc(rep.name)}</div><h2>${esc(rep.name)}</h2></div>
+      <div class="actions"><button class="btn btn-ghost" onclick="nav('reports')">← Reports</button>
+        ${can('export')?`<button class="btn btn-ghost" onclick="exportReport()">⬇ Excel</button><button class="btn btn-ghost" onclick="printReport()">🖨 PDF</button>`:''}</div></div>
+    <div class="card"><div class="table-wrap"><table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead>
+      <tbody>${rows.length?rows.map(r=>`<tr>${cols.map(c=>`<td>${typeof r[c]==='number'?num(r[c]):esc(r[c]==null?'':r[c])}</td>`).join('')}</tr>`).join(''):`<tr><td colspan="${cols.length||1}" class="empty">No data.</td></tr>`}</tbody></table></div></div>`;
+}
+function exportReport(){sheetDownload(currentReport.rows,currentReport.rep.name,currentReport.rep.key);}
+function printReport(){printTable(currentReport.rep.name,currentReport.rows);}
+function printTable(title,rows){
+  const cols=rows.length?Object.keys(rows[0]):[];
+  const w=window.open('','_blank');
+  w.document.write(`<html><head><title>${esc(title)}</title><style>body{font-family:Arial;margin:24px;color:#1c2733}h1{color:#0a5244;font-size:18px}table{width:100%;border-collapse:collapse;font-size:11px;margin-top:10px}th,td{border:1px solid #ccc;padding:5px 7px;text-align:left}th{background:#0a5244;color:#fff}.meta{color:#69757f;font-size:11px;margin-bottom:8px}</style></head><body>
+    <h1>MLIMS — ${esc(title)}</h1><div class="meta">Generated ${new Date().toLocaleString()} by ${esc(SESSION.name)} · ${rows.length} row(s)</div>
+    <table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${typeof r[c]==='number'?num(r[c]):esc(r[c]==null?'':r[c])}</td>`).join('')}</tr>`).join('')}</tbody></table>
+    </body></html>`);
+  w.document.close();setTimeout(()=>w.print(),300);
+}
+
+/* ============================================================
+   USERS & ROLES
+   ============================================================ */
+function renderUsers(){
+  if(!isAdmin())return nav('dashboard');
+  const us=DB.all('users');
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Administration</div><h2>👥 Users & Roles</h2></div>
+      <div class="actions"><button class="btn" onclick="userForm()">+ Add User</button></div></div>
+    <div class="card"><div class="table-wrap"><table>
+      <thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th class="right">Actions</th></tr></thead>
+      <tbody>${us.map(u=>`<tr><td><b>${esc(u.name)}</b></td><td>${esc(u.username)}</td>
+        <td><span class="role-badge" style="background:var(--primary-light);color:var(--primary-dark)">${ROLE_LABEL[u.role]||u.role}</span></td>
+        <td>${u.active?'<span class="pill green">Active</span>':'<span class="pill red">Disabled</span>'}</td>
+        <td><div class="row-actions"><button class="icon-btn" onclick="userForm('${u.id}')">✏️</button>
+        <button class="icon-btn" onclick="toggleUser('${u.id}')">${u.active?'🚫':'✔'}</button>
+        ${u.username!==SESSION.username?`<button class="icon-btn danger" onclick="confirmBox('Delete user','Delete <b>${esc(u.name)}</b>?',()=>{DB.remove('users','${u.id}');renderUsers();})">🗑</button>`:''}</div></td></tr>`).join('')}</tbody></table></div></div>
+    <div class="card"><div class="card-h">Role Permission Matrix <span class="sub">configurable capabilities per role</span></div><div class="table-wrap"><table>
+      <thead><tr><th>Capability</th>${ROLES.map(r=>`<th class="center">${ROLE_LABEL[r]}</th>`).join('')}</tr></thead>
+      <tbody>${PERM_ROWS.map(([label,act])=>`<tr><td>${esc(label)}</td>${ROLES.map(r=>{const ok=act==='view'?true:(ROLE_PERMS[r].includes('*')||ROLE_PERMS[r].includes(act));return `<td class="center" style="color:${ok?'var(--ok)':'var(--danger)'}">${ok?'✔':'—'}</td>`;}).join('')}</tr>`).join('')}</tbody></table></div></div>`;
+}
+const PERM_ROWS=[['View all data','view'],['Edit master data','master.edit'],['Edit employees','employee.edit'],['Edit dependents','dependent.edit'],['Create policy','policy.create'],['Edit policy','policy.edit'],['Suspend / reactivate','policy.suspend'],['Renew policy','policy.renew'],['Cancel policy','policy.cancel'],['Manage documents','document.manage'],['Import','import'],['Export','export'],['Manage users','users.manage'],['Manage settings','settings.manage'],['Delete records','*']];
+function userForm(id){
+  const u=id?DB.byId('users',id):{active:true};
+  modal(id?'Edit User':'Add User',`<div class="form-grid">
+    <div class="field full"><label>Full Name</label><input id="ff_name" value="${esc(u.name||'')}"></div>
+    <div class="field"><label>Username</label><input id="ff_username" value="${esc(u.username||'')}"></div>
+    <div class="field"><label>Password</label><input id="ff_password" value="${esc(u.password||'')}"></div>
+    <div class="field"><label>Role</label><select id="ff_role">${ROLES.map(r=>`<option value="${r}" ${u.role===r?'selected':''}>${ROLE_LABEL[r]}</option>`).join('')}</select></div>
+    <div class="field"><label>Status</label><select id="ff_active"><option value="true" ${u.active!==false?'selected':''}>Active</option><option value="false" ${u.active===false?'selected':''}>Disabled</option></select></div>
+  </div><p class="help" style="font-size:11.5px;color:var(--muted);margin-top:8px">Role determines permissions per the matrix on the Users page.</p>`,[
+    {label:'Cancel',cls:'btn-ghost',fn:closeModal},
+    {label:id?'Save':'Create',cls:'btn',fn:()=>{
+      const name=val('ff_name').trim(),un=val('ff_username').trim(),pw=val('ff_password').trim();
+      if(!name||!un||!pw){toast('Name, username and password required.','err');return;}
+      if(DB.all('users').some(x=>x.username.toLowerCase()===un.toLowerCase()&&x.id!==id)){toast('Username exists.','err');return;}
+      const data={name,username:un,password:pw,role:val('ff_role'),active:val('ff_active')==='true'};
+      if(id)DB.update('users',id,data);else DB.insert('users',data);
+      closeModal();renderUsers();toast('User saved.','ok');
+    }}
+  ]);
+}
+function toggleUser(id){const u=DB.byId('users',id);if(u.username===SESSION.username){toast("You can't disable your own account.",'err');return;}DB.update('users',id,{active:!u.active});renderUsers();}
+
+/* ============================================================
+   AUDIT LOG
+   ============================================================ */
+let auditFilter={q:'',action:''};
+function renderAudit(){
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Administration</div><h2>🛡️ Audit Log</h2></div>
+      <div class="actions">${can('export')?`<button class="btn btn-ghost" onclick="sheetDownload(auditRows(),'Audit Log','audit')">⬇ Excel</button>`:''}
+      <span class="role-badge" style="background:#fbe5e2;color:#b0392b">Immutable</span></div></div>
+    <div class="toolbar">
+      <input class="grow" placeholder="🔍 Search user, record, entity…" oninput="auditFilter.q=this.value;drawAudit()">
+      <select onchange="auditFilter.action=this.value;drawAudit()"><option value="">All Actions</option>${['CREATE','UPDATE','DELETE','LOGIN','LOGOUT'].map(a=>`<option>${a}</option>`).join('')}</select>
+    </div>
+    <div class="card"><div class="table-wrap"><table>
+      <thead><tr><th>Timestamp</th><th>User</th><th>Role</th><th>Action</th><th>Entity</th><th>Record</th><th>Changes</th></tr></thead>
+      <tbody id="auditBody"></tbody></table></div></div>`;
+  drawAudit();
+}
+function auditRows(){
+  let rows=DB.all('audit').slice().reverse();const q=auditFilter.q.toLowerCase();
+  if(auditFilter.action)rows=rows.filter(a=>a.action===auditFilter.action);
+  if(q)rows=rows.filter(a=>[a.user,a.entity,a.recordLabel,a.action].join(' ').toLowerCase().includes(q));
+  return rows;
+}
+function drawAudit(){
+  const rows=auditRows();const body=document.getElementById('auditBody');
+  if(!body)return;
+  if(!rows.length){body.innerHTML=`<tr><td colspan="7" class="empty">No audit entries.</td></tr>`;return;}
+  body.innerHTML=rows.slice(0,500).map(a=>`<tr>
+    <td class="muted" style="white-space:nowrap">${new Date(a.ts).toLocaleString()}</td><td>${esc(a.user)}</td><td>${esc(a.role)}</td>
+    <td><span class="pill ${a.action==='DELETE'?'red':a.action==='CREATE'?'green':a.action==='UPDATE'?'blue':'grey'}">${a.action}</span></td>
+    <td>${esc(a.entity)}</td><td>${esc(a.recordLabel)}</td>
+    <td class="muted" style="font-size:11.5px">${(a.changes||[]).map(c=>`${esc(c.field)}: ${esc(fmtChange(c.old))}→${esc(fmtChange(c.new))}`).join('<br>')||'—'}</td></tr>`).join('');
+}
+
+/* ============================================================
+   SETTINGS
+   ============================================================ */
+function renderSettings(){
+  if(!isAdmin())return nav('dashboard');
+  const s=getSettings();
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Administration</div><h2>⚙️ Settings</h2></div></div>
+    <div class="card"><div class="card-h">Alert Reminder Intervals</div><div class="card-b">
+      <p class="help" style="margin-bottom:10px;color:var(--muted)">Days before expiry at which alerts are raised (policies, Iqama / National ID).</p>
+      <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">
+        <input id="ff_reminders" value="${(s.reminderDays||[]).join(', ')}" style="padding:8px 11px;border:1px solid var(--line);border-radius:8px;width:280px">
+        <button class="btn btn-sm" onclick="saveReminders()">Save</button>
+        <span class="muted">comma-separated, e.g. 90, 60, 30, 15, 7</span>
+      </div></div></div>
+    <div class="card"><div class="card-h">System</div><div class="card-b">
+      ${kv('Base Currency',s.baseCurrency||'SAR')}
+      ${kv('Employees',DB.all('employees').length)}
+      ${kv('Dependents',DB.all('dependents').length)}
+      ${kv('Medical Policies',DB.all('medPolicies').length)}
+      ${kv('Life Policies',DB.all('lifePolicies').length)}
+      ${kv('Vehicle Policies',DB.all('vehiclePolicies').length)}
+      ${kv('Audit entries',DB.all('audit').length)}
+      <div style="margin-top:12px"><button class="btn btn-danger btn-sm" onclick="resetDemo()">Reset demo data</button>
+      <span class="muted" style="margin-left:8px">Clears all data and reloads with fresh seed.</span></div>
+    </div></div>`;
+}
+function saveReminders(){const v=val('ff_reminders').split(',').map(x=>parseInt(x.trim())).filter(x=>!isNaN(x)&&x>0).sort((a,b)=>b-a);if(!v.length){toast('Enter valid numbers.','err');return;}DB.update('settings','singleton',{reminderDays:v});refreshBadges();toast('Reminder intervals saved.','ok');}
+function resetDemo(){confirmBox('Reset demo data','This clears ALL MLIMS data (employees, dependents, policies, users, audit) and reloads with fresh seed. Continue?',()=>{Object.keys(localStorage).filter(k=>k.startsWith('mlims_')).forEach(k=>localStorage.removeItem(k));location.reload();});}
+
