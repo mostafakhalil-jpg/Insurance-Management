@@ -268,17 +268,19 @@ const MASTER_ORDER=['companies','businessUnits','divisions','departments','insur
 
 /* ---------------- record entity field definitions ---------------- */
 const GENDERS=['Male','Female'];
-const RELATIONSHIPS=['Spouse','Son','Daughter','Father','Mother','Other'];
-/* insurance grade → class/network mapping (per agreed rate card) */
+const RELATIONSHIPS=['Wife','Wife Without Maternity','Husband','Son','Daughter','Father','Mother','Other'];
+/* insurance grade → class band mapping (per agreed rate card) */
 const CLASSES=[
-  {code:'VIP',network:'NW7',grade:'GEN 19 + Above'},
-  {code:'A',network:'NW6',grade:'GEN 16 + Above'},
-  {code:'B',network:'NW3',grade:'GEN 13 + Above'},
-  {code:'C',network:'NW1',grade:'GEN 09 + Above'},
-  {code:'GEN.R',network:'NWM',grade:'GEN.R'}
+  {code:'VIP',grade:'GEN.19 + Above',min:19},
+  {code:'A',grade:'GEN.16 + Above',min:16},
+  {code:'B',grade:'GEN.13 + Above',min:13},
+  {code:'C',grade:'GEN.09 + Above',min:9}
 ];
 const CLASS_CODES=CLASSES.map(c=>c.code);
-const MEMBER_TYPES=['Employee','Female Employee (With Mat)','Wife (With Maternity)','Wife (Without Maternity)','Child','Senior Employee','Parent','Others'];
+/* member types = employee categories + dependent relationships used in the rate card */
+const MEMBER_TYPES=['Employee','Female Employee (With Mat)','Senior Employee','Wife','Wife Without Maternity','Husband','Son','Daughter'];
+const EMP_MEMBER_TYPES=['Employee','Female Employee (With Mat)','Senior Employee'];
+const DEFAULT_BANDS=CLASSES.map(c=>({cls:c.code,min:c.min}));
 const EMP_FIELDS=[
   {k:'empNo',label:'Employee Number',req:true},
   {k:'name',label:'Employee Name',req:true},
@@ -294,6 +296,8 @@ const EMP_FIELDS=[
   {k:'department',label:'Department',type:'ref',ref:'departments'},
   {k:'grade',label:'Grade'},
   {k:'insuranceClass',label:'Insurance Class',type:'select',options:CLASS_CODES},
+  {k:'medMemberType',label:'Medical Member Type',type:'select',options:EMP_MEMBER_TYPES},
+  {k:'glCode',label:'GL Code'},
   {k:'jobTitle',label:'Job Title'},
   {k:'mobile',label:'Mobile'},
   {k:'email',label:'Email'},
@@ -308,6 +312,7 @@ const DEP_FIELDS=[
   {k:'passport',label:'Passport Number'},
   {k:'dob',label:'Date of Birth',type:'date'},
   {k:'gender',label:'Gender',type:'select',options:GENDERS},
+  {k:'payer',label:'Premium Payer',type:'select',options:['Company','Personal']},
   {k:'status',label:'Status',type:'select',options:['Active','Inactive']}
 ];
 
@@ -373,32 +378,35 @@ function iqamaClash(iqama,selfColl,selfId){
   return null;
 }
 
-/* ---------------- premium rate card ---------------- */
+/* ---------------- premium rate card (Class × Relationship) ---------------- */
 function getRateCard(){return DB.byId('premiumRates','card')||{id:'card',year:new Date().getFullYear(),rates:{}};}
 function premiumLookup(memberType,classCode){const c=getRateCard();return (c.rates&&c.rates[memberType]&&Number(c.rates[memberType][classCode]))||0;}
-function relMemberType(rel){if(rel==='Spouse')return 'Wife (Without Maternity)';if(rel==='Son'||rel==='Daughter')return 'Child';if(rel==='Father'||rel==='Mother')return 'Parent';return 'Others';}
-/* map an employee grade band (e.g. "GEN 16") to a rate-card class */
-function classFromGrade(grade){if(!grade)return '';const g=String(grade).toUpperCase();if(g.includes('GEN.R')||g.includes('GENR')||g.includes('GEN R'))return 'GEN.R';const m=g.match(/(\d+)/);if(!m)return '';const n=+m[1];if(n>=19)return 'VIP';if(n>=16)return 'A';if(n>=13)return 'B';if(n>=9)return 'C';return 'GEN.R';}
+/* grade → class band mapping (editable) */
+function gradeNum(g){if(g==null||g==='')return null;const m=String(g).toUpperCase().match(/(\d+(?:\.\d+)?)/);return m?Math.floor(parseFloat(m[1])):null;}
+function getBands(){const d=DB.byId('gradeBands','card');return (d&&d.bands&&d.bands.length)?d.bands:DEFAULT_BANDS;}
+function classFromGrade(grade){const n=gradeNum(grade);if(n==null)return '';const b=getBands().slice().sort((a,b)=>b.min-a.min);for(const x of b){if(n>=x.min)return x.cls;}return '';}
 function resolveClass(e){if(!e)return '';return e.insuranceClass||classFromGrade(e.grade)||'';}
-/* auto premium from grade/class + coverage scope (manual override always allowed) */
-function calcMedicalPremium(employeeId,coverageClass){
-  const e=DB.byId('employees',employeeId);if(!e)return 0;
-  const cls=resolveClass(e)||'B';
-  const empType=e.gender==='Female'?'Female Employee (With Mat)':'Employee';
-  let total=premiumLookup(empType,cls)||premiumLookup('Employee',cls);
-  if(coverageClass&&coverageClass!=='Employee Only'){
-    DB.all('dependents').filter(d=>d.employeeId===employeeId&&d.status==='Active').forEach(d=>{
-      if(coverageClass==='Employee + Spouse'&&d.relationship!=='Spouse')return;
-      total+=premiumLookup(relMemberType(d.relationship),cls);
-    });
-  }
-  return total;
+/* member-type resolution */
+function empMemberType(e){return (e&&e.medMemberType)||'Employee';}
+function depMemberType(d){const r=d.relationship;if(MEMBER_TYPES.includes(r))return r;if(r==='Spouse')return 'Wife';return '';}
+/* expand a medical policy into priced member lines (employee + active dependents) */
+function policyMembers(p){
+  const e=DB.byId('employees',p.employeeId);const out=[];if(!e)return out;
+  const cls=resolveClass(e);const emt=empMemberType(e);
+  out.push({empId:e.id,name:e.name,idNo:e.iqama,rel:'Employee',mtype:emt,cls,premium:cls?premiumLookup(emt,cls):0,payer:e.payer||'Company',glCode:e.glCode||'',norate:!cls,isEmployee:true});
+  DB.all('dependents').filter(d=>d.employeeId===e.id&&d.status==='Active').forEach(d=>{
+    const mt=depMemberType(d);
+    out.push({depId:d.id,name:d.name,idNo:d.iqama,rel:d.relationship,mtype:mt,cls,premium:(cls&&mt)?premiumLookup(mt,cls):0,payer:d.payer||'Company',glCode:e.glCode||'',norate:!(cls&&mt)});
+  });
+  return out;
 }
+/* auto premium = sum of member rates (manual override always allowed) */
+function calcMedicalPremium(employeeId){return policyMembers({employeeId}).reduce((s,m)=>s+Number(m.premium||0),0);}
 /* compare a medical policy's entered premium against the rate card */
 function medPremiumVariance(p){
   const e=DB.byId('employees',p.employeeId);if(!e)return null;
   const cls=resolveClass(e);if(!cls)return {expected:0,actual:Number(p.annualPremium||0),diff:0,off:false,noClass:true};
-  const expected=calcMedicalPremium(p.employeeId,p.coverageClass);
+  const expected=calcMedicalPremium(p.employeeId);
   const actual=Number(p.annualPremium||0);
   const diff=+(actual-expected).toFixed(2);
   return {expected,actual,diff,cls,off:Math.abs(diff)>0.5};
@@ -430,18 +438,22 @@ function seedSettings(){
 }
 function getSettings(){const s=DB.byId('settings','singleton');return s||{reminderDays:[90,60,30,15,7],baseCurrency:'SAR'};}
 function seedRates(){
-  if(localStorage.getItem('mlims_premiumRates'))return;
-  const R={
-    'Employee':{'VIP':9324,'A':3983,'B':3115,'C':2238,'GEN.R':1184},
-    'Female Employee (With Mat)':{'VIP':13698,'A':6878,'B':4728,'C':3104,'GEN.R':1545},
-    'Wife (With Maternity)':{'VIP':13698,'A':6878,'B':4728,'C':3104,'GEN.R':1545},
-    'Wife (Without Maternity)':{'VIP':9324,'A':3983,'B':3115,'C':2238,'GEN.R':1184},
-    'Child':{'VIP':9324,'A':3983,'B':3115,'C':2238,'GEN.R':1184},
-    'Senior Employee':{'VIP':37298,'A':15932,'B':12857,'C':10070,'GEN.R':5329},
-    'Parent':{'VIP':57805,'A':24774,'B':20013,'C':15665,'GEN.R':8290},
-    'Others':{'VIP':9324,'A':3983,'B':3115,'C':2238,'GEN.R':1184}
-  };
-  DB._save('premiumRates',[{id:'card',year:2024,insurer:'',rates:R}]);
+  if(!localStorage.getItem('mlims_premiumRates')){
+    const R={
+      'Employee':{'VIP':10060,'A':4293,'B':3347,'C':2406},
+      'Female Employee (With Mat)':{'VIP':14785,'A':7409,'B':3347,'C':3343},
+      'Senior Employee':{'VIP':0,'A':17120,'B':13825,'C':9720},
+      'Wife':{'VIP':14785,'A':7409,'B':5106,'C':3343},
+      'Wife Without Maternity':{'VIP':10060,'A':4293,'B':3347,'C':2406},
+      'Husband':{'VIP':10060,'A':4293,'B':3347,'C':2406},
+      'Son':{'VIP':10060,'A':4293,'B':3347,'C':2406},
+      'Daughter':{'VIP':10060,'A':4293,'B':3347,'C':2406}
+    };
+    DB._save('premiumRates',[{id:'card',year:2026,insurer:'',rates:R}]);
+  }
+  if(!localStorage.getItem('mlims_gradeBands')){
+    DB._save('gradeBands',[{id:'card',bands:DEFAULT_BANDS.slice()}]);
+  }
 }
 
 function seedAll(){
@@ -470,7 +482,7 @@ function seedAll(){
   const insMed=mk('insuranceCompanies',{code:'MEDGULF',name:'MedGulf',contact:'Mr. Sami Nasser',phone:'+966 11 488 0123',email:'group@medgulf.com.sa',address:'Riyadh, KSA',notes:''});
   const insGig=mk('insuranceCompanies',{code:'GIG',name:'GIG Gulf Saudi',contact:'Ms. Lina Omar',phone:'+966 12 690 7000',email:'life@gig.com.sa',address:'Jeddah, KSA',notes:'Group life carrier.'});
   // employees
-  const E=(o)=>mk('employees',Object.assign({status:'Active',nationality:'Saudi',company:co.id,grade:'GEN 13',insuranceClass:'B'},o));
+  const E=(o)=>mk('employees',Object.assign({status:'Active',nationality:'Saudi',company:co.id,grade:'GEN.13',insuranceClass:'B',medMemberType:'Employee',glCode:'1211-650-121-201-2008'},o));
   const e1=E({empNo:'E-1001',name:'Tariq Al-Otaibi',iqama:'2412345671',iqamaExpiry:d(120),passport:'A1234567',dob:'1985-03-12',gender:'Male',nationality:'Saudi',businessUnit:bu1.id,division:divFleet.id,department:depOps.id,jobTitle:'Operations Manager',grade:'GEN 16',insuranceClass:'A',mobile:'+966 50 111 2222',email:'tariq@naghi.com'});
   const e2=E({empNo:'E-1002',name:'Hala Al-Qahtani',iqama:'2412345672',iqamaExpiry:d(20),passport:'B2233445',dob:'1990-07-25',gender:'Female',nationality:'Saudi',businessUnit:bu2.id,division:divHR.id,department:depPay.id,jobTitle:'HR Officer',mobile:'+966 50 333 4444',email:'hala@naghi.com'});
   const e3=E({empNo:'E-1003',name:'Rajesh Kumar',iqama:'2456781234',iqamaExpiry:d(-5),passport:'P9988776',dob:'1988-11-02',gender:'Male',nationality:'Indian',businessUnit:bu3.id,division:divFleet.id,department:depOps.id,jobTitle:'Logistics Supervisor',mobile:'+966 54 777 8888',email:'rajesh@naghi.com'});
@@ -480,13 +492,13 @@ function seedAll(){
   const e7=E({empNo:'E-1007',name:'Sara Al-Dossari',iqama:'2412345677',iqamaExpiry:d(45),passport:'E7788990',dob:'1995-12-14',gender:'Female',nationality:'Saudi',businessUnit:bu1.id,division:divSales.id,department:depSal.id,jobTitle:'Marketing Coordinator',mobile:'+966 50 656 7878',email:'sara@naghi.com'});
   const e8=E({empNo:'E-1008',name:'John Mensah',iqama:'2433221100',iqamaExpiry:d(160),passport:'GH102030',dob:'1986-06-21',gender:'Male',nationality:'Ghanaian',status:'Inactive',businessUnit:bu3.id,division:divFleet.id,department:depOps.id,jobTitle:'Driver',mobile:'+966 59 121 3434',email:'john@naghi.com'});
   // dependents
-  const D=(o)=>mk('dependents',Object.assign({status:'Active'},o));
-  D({depNo:'D-0001',employeeId:e1.id,relationship:'Spouse',name:'Amal Al-Otaibi',iqama:'2512345001',iqamaExpiry:d(120),gender:'Female',dob:'1988-04-10'});
+  const D=(o)=>mk('dependents',Object.assign({status:'Active',payer:'Company'},o));
+  D({depNo:'D-0001',employeeId:e1.id,relationship:'Wife',name:'Amal Al-Otaibi',iqama:'2512345001',iqamaExpiry:d(120),gender:'Female',dob:'1988-04-10'});
   D({depNo:'D-0002',employeeId:e1.id,relationship:'Son',name:'Faisal Al-Otaibi',iqama:'2512345002',iqamaExpiry:d(120),gender:'Male',dob:'2014-09-01'});
   D({depNo:'D-0003',employeeId:e1.id,relationship:'Daughter',name:'Lujain Al-Otaibi',iqama:'2512345003',iqamaExpiry:d(15),gender:'Female',dob:'2017-02-17'});
-  D({depNo:'D-0004',employeeId:e4.id,relationship:'Spouse',name:'Noura Al-Mutairi',iqama:'2512345004',iqamaExpiry:d(300),gender:'Female',dob:'1985-08-23'});
+  D({depNo:'D-0004',employeeId:e4.id,relationship:'Wife',name:'Noura Al-Mutairi',iqama:'2512345004',iqamaExpiry:d(300),gender:'Female',dob:'1985-08-23'});
   D({depNo:'D-0005',employeeId:e5.id,relationship:'Son',name:'Diego Santos',iqama:'2512345005',iqamaExpiry:d(-2),gender:'Male',dob:'2012-11-11'});
-  D({depNo:'D-0006',employeeId:e7.id,relationship:'Mother',name:'Munira Al-Dossari',iqama:'2512345006',iqamaExpiry:d(60),gender:'Female',dob:'1960-01-05'});
+  D({depNo:'D-0006',employeeId:e7.id,relationship:'Mother',name:'Munira Al-Dossari',iqama:'2512345006',iqamaExpiry:d(60),gender:'Female',dob:'1960-01-05',payer:'Personal'});
   // medical policies
   const MP=(o)=>DB.insert('medPolicies',Object.assign({status:'Active',attachments:[]},o),sil);
   MP({policyNo:'MED-2026-0001',insurer:insBupa.id,employeeId:e1.id,plan:'Class A',coverageClass:'Employee + Family',effectiveDate:d(-200),expiryDate:d(165),annualPremium:18500,companyContribution:18500,employeeContribution:0,attachments:[{name:'Bupa Card - Tariq.pdf',size:142000,type:'application/pdf',data:'#',category:'Insurance Card',expiry:'',uploadedAt:nowISO(),uploadedBy:'admin'}]});
@@ -495,6 +507,8 @@ function seedAll(){
   MP({policyNo:'MED-2026-0004',insurer:insMed.id,employeeId:e4.id,plan:'VIP',coverageClass:'Employee + Family',effectiveDate:d(-90),expiryDate:d(275),annualPremium:27500,companyContribution:27500,employeeContribution:0});
   MP({policyNo:'MED-2026-0005',insurer:insBupa.id,employeeId:e5.id,plan:'Class B',coverageClass:'Employee + Spouse',effectiveDate:d(-60),expiryDate:d(8),annualPremium:11400,companyContribution:8000,employeeContribution:3400});
   MP({policyNo:'MED-2026-0006',insurer:insTaw.id,employeeId:e7.id,plan:'Class B',coverageClass:'Employee Only',effectiveDate:d(-20),expiryDate:d(345),annualPremium:9600,companyContribution:9600,employeeContribution:0,status:'Suspended'});
+  // align seeded medical premiums to the per-member rate card so the demo shows on-rate pricing
+  DB.all('medPolicies').forEach(mp=>{const prem=calcMedicalPremium(mp.employeeId);if(prem>0)DB.update('medPolicies',mp.id,{annualPremium:prem,companyContribution:prem},{silent:true});});
   // life policies
   const LP=(o)=>DB.insert('lifePolicies',Object.assign({status:'Active',attachments:[]},o),sil);
   LP({policyNo:'LIF-2026-0001',employeeId:e1.id,insurer:insGig.id,sumAssured:1000000,beneficiary:'Amal Al-Otaibi (Spouse)',premium:3200,effectiveDate:d(-200),expiryDate:d(165)});
@@ -544,6 +558,8 @@ const NAV=[
   {p:'life',ico:'🛡️',label:'Life Insurance'},
   {p:'vehicle',ico:'🚗',label:'Vehicle Insurance'},
   {p:'documents',ico:'📎',label:'Documents'},
+  {sep:'Finance'},
+  {p:'billing',ico:'🧾',label:'Billing & Statements'},
   {p:'reports',ico:'📈',label:'Reports'},
   {sep:'Configuration'},
   {p:'premiumRates',ico:'💲',label:'Premium Rates'},
@@ -576,7 +592,7 @@ function nav(page,arg){
   const m=document.getElementById('main');m.scrollTop=0;
   const fn={dashboard:renderDashboard,notifications:renderNotifications,employees:renderEmployees,dependents:renderDependents,
     medical:()=>renderPolicies('medical'),life:()=>renderPolicies('life'),vehicle:()=>renderPolicies('vehicle'),
-    documents:renderDocuments,reports:renderReports,premiumRates:renderPremiumRates,
+    documents:renderDocuments,reports:renderReports,premiumRates:renderPremiumRates,billing:renderBilling,
     master:renderMasterHub,users:renderUsers,audit:renderAudit,settings:renderSettings}[page];
   (fn||renderDashboard)(arg);
 }
@@ -714,6 +730,7 @@ function renderEmployees(){
       <div class="actions">
         ${can('export')?`<button class="btn btn-ghost" onclick="exportEmployees()">⬇ Excel</button>`:''}
         ${editable&&can('import')?`<button class="btn btn-ghost" onclick="document.getElementById('impE').click()">⬆ Import</button><input type="file" id="impE" class="hidden" accept=".xlsx,.xls,.csv" onchange="importEmployees(this)">`:''}
+        ${editable&&can('import')?`<button class="btn btn-ghost" onclick="document.getElementById('impGrade').click()">⬆ Import Grades</button><input type="file" id="impGrade" class="hidden" accept=".xlsx,.xls" onchange="importGradeSheet(this)">`:''}
         ${editable?`<button class="btn" onclick="employeeForm()">+ New Employee</button>`:''}
       </div></div>
     <div class="toolbar"><input class="grow" placeholder="🔍 Search name, employee no, Iqama…" value="${esc(empQ)}" oninput="empQ=this.value;drawEmployees()"></div>
@@ -843,6 +860,8 @@ function empDetails(e){
       ${kv('Department',esc(refLabel('departments',e.department)))}
       ${kv('Grade',esc(e.grade))}
       ${kv('Insurance Class',esc(resolveClass(e))+(e.insuranceClass?'':e.grade?' <span class="muted">(from grade)</span>':''))}
+      ${kv('Medical Member Type',esc(e.medMemberType||'Employee'))}
+      ${kv('GL Code',esc(e.glCode))}
       ${kv('Job Title',esc(e.jobTitle))}
       ${kv('Mobile',esc(e.mobile))}
       ${kv('Email',esc(e.email))}
@@ -973,6 +992,8 @@ function renderPolicies(kind){
     <div class="page-head"><div><div class="crumb">Insurance</div><h2>${cfg.icon} ${esc(cfg.label)}</h2></div>
       <div class="actions">
         ${can('export')?`<button class="btn btn-ghost" onclick="exportPolicies('${kind}')">⬇ Excel</button><button class="btn btn-ghost" onclick="printPolicies('${kind}')">🖨 PDF</button>`:''}
+        ${kind==='medical'&&can('policy.create')&&can('import')?`<button class="btn btn-ghost" onclick="document.getElementById('impCensus').click()">⬆ Import Census</button><input type="file" id="impCensus" class="hidden" accept=".xlsx,.xls" onchange="importMedicalCensus(this)">`:''}
+        ${kind==='life'&&can('policy.create')&&can('import')?`<button class="btn btn-ghost" onclick="document.getElementById('impLife').click()">⬆ Import Life</button><input type="file" id="impLife" class="hidden" accept=".xlsx,.xls,.csv" onchange="importLifeCensus(this)">`:''}
         ${can('policy.create')?`<button class="btn" onclick="policyForm('${kind}')">+ New ${esc(cfg.short)}</button>`:''}
       </div></div>
     <div class="toolbar">
@@ -1039,13 +1060,14 @@ function policyForm(kind,id,presetEmp){
     btns,true);
 }
 function autoMedicalPremium(){
-  const empId=val('ff_employeeId');const cov=val('ff_coverageClass');
+  const empId=val('ff_employeeId');
   if(!empId){toast('Select an employee first.','err');return;}
-  const amt=calcMedicalPremium(empId,cov);
+  const e=DB.byId('employees',empId);const cls=resolveClass(e);
+  if(!cls){toast('This employee has no grade/class — set it first.','err');return;}
+  const members=policyMembers({employeeId:empId});const amt=members.reduce((s,m)=>s+Number(m.premium||0),0);
   const el=document.getElementById('ff_annualPremium');if(el)el.value=amt;
-  const cc=document.getElementById('ff_companyContribution');if(cc&&!cc.value)cc.value=amt;
-  const e=DB.byId('employees',empId);
-  toast(`Premium ${num(amt)} from rate card (class ${e&&e.insuranceClass||'B'}). Editable.`,'ok');
+  const cc=document.getElementById('ff_companyContribution');if(cc&&!cc.value)cc.value=members.filter(m=>m.payer!=='Personal').reduce((s,m)=>s+Number(m.premium||0),0);
+  toast(`Premium ${num(amt)} for ${members.length} member(s), class ${cls}. Editable.`,'ok');
 }
 function savePolicy(kind,id){
   const cfg=POLICIES[kind];const patch={};cfg.fields.forEach(f=>patch[f.k]=readField(f));
@@ -1135,7 +1157,18 @@ function policyDetails(cfg,p){
       ${(()=>{const e=DB.byId('employees',p.employeeId);if(!e)return '<div class="empty">'+(cfg.optionalEmp?'No '+(cfg.empLabel||'employee').toLowerCase()+' linked.':'Employee not found.')+'</div>';
         return kv('Name',esc(e.name))+kv('Employee No.',esc(e.empNo))+kv('Iqama / ID',esc(e.iqama))+kv('Insurance Class',esc(e.insuranceClass))+kv('Division',esc(refLabel('divisions',e.division)))+kv('Status',e.status)+`<div style="margin-top:10px"><a href="#" onclick="renderEmployeeDetail('${e.id}');return false" class="btn btn-sm btn-ghost">Open employee →</a></div>`;})()}
     </div></div>
-  </div>`;
+  </div>${cfg.kind==='medical'?medMembersCard(p):''}`;
+}
+function medMembersCard(p){
+  const members=policyMembers(p);if(!members.length)return '';
+  const total=members.reduce((s,m)=>s+Number(m.premium||0),0);
+  const company=members.filter(m=>m.payer!=='Personal').reduce((s,m)=>s+Number(m.premium||0),0);
+  const personal=+(total-company).toFixed(2);
+  return `<div class="card"><div class="card-h">Member Premium Breakdown <span class="sub">priced per member from the rate card</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Member</th><th>Relationship</th><th>Member Type</th><th>Class</th><th>Payer</th><th class="right">Annual Premium</th></tr></thead>
+    <tbody>${members.map(m=>`<tr><td>${esc(m.name)}${m.isEmployee?' <span class="pill blue">Employee</span>':''}</td><td>${esc(m.rel)}</td><td>${m.norate?'<span class="pill amber">no rate</span>':esc(m.mtype)}</td><td>${esc(m.cls)||'<span class="pill grey">no class</span>'}</td><td>${esc(m.payer)}</td><td class="right">${m.norate?'—':num(m.premium)}</td></tr>`).join('')}
+    <tr style="font-weight:700;background:#f6f8fa"><td colspan="5">Total &nbsp;<span class="muted" style="font-weight:400">Company ${num(company)} · Personal ${num(personal)}</span></td><td class="right">${num(total)}</td></tr>
+    </tbody></table></div></div>`;
 }
 function policyWorkflowButtons(cfg,p){
   const s=p.status;const b=[];const k=cfg.kind;
@@ -1326,12 +1359,252 @@ function renderDashboard(){
 function barChart(obj,max,isMoney){const ent=Object.entries(obj).sort((a,b)=>b[1]-a[1]);if(!ent.length)return '<div class="muted">No data.</div>';return ent.map(([k,v])=>`<div class="bar-row"><div class="top"><span>${esc(k)}</span><span class="muted">${isMoney?num(v):v}</span></div><div class="bar-track"><div class="bar-fill" style="width:${max?Math.round(v/max*100):0}%"></div></div></div>`).join('');}
 
 /* ============================================================
+   IMPORTERS (real census / grade sheets)
+   ============================================================ */
+function gv(o){for(let i=1;i<arguments.length;i++){const k=arguments[i];if(o[k]!==undefined&&o[k]!==null&&o[k]!=='')return o[k];}return '';}
+function pickSheet(wb,re){const nm=wb.SheetNames.find(s=>re.test(s));return wb.Sheets[nm||wb.SheetNames[0]];}
+/* read a worksheet into objects with normalized (lowercase, single-spaced) keys,
+   auto-detecting the real header row (handles leading blank rows). */
+function sheetRows(ws){
+  const aoa=XLSX.utils.sheet_to_json(ws,{header:1,defval:'',blankrows:false});
+  const tokens=['membername','member name','relationship','staffnumber','staff number','idno','id no','employee number','employeenumber','insured name','premium','grade','employee name','position'];
+  let hi=0,best=-1;
+  aoa.slice(0,20).forEach((r,i)=>{const score=r.reduce((s,c)=>s+(tokens.some(t=>String(c).toLowerCase().replace(/\s+/g,' ').trim()===t||String(c).toLowerCase().replace(/\s+/g,' ').trim().includes(t))?1:0),0);if(score>best){best=score;hi=i;}});
+  const headers=(aoa[hi]||[]).map(h=>String(h).toLowerCase().replace(/\s+/g,' ').trim());
+  const out=[];
+  for(let i=hi+1;i<aoa.length;i++){const r=aoa[i];const o={};let any=false;headers.forEach((h,j)=>{if(h){const v=r[j]===undefined?'':r[j];if(o[h]===undefined||o[h]==='')o[h]=v;if(v!=='')any=true;}});if(any)out.push(o);}
+  return out;
+}
+function ensureInsurer(re,name){let i=DB.all('insuranceCompanies').find(x=>re.test(x.name));if(!i)i=DB.insert('insuranceCompanies',{code:name.slice(0,6).toUpperCase(),name},{silent:true});return i.id;}
+function mapRelationship(code,rel){const c=String(code||'').toUpperCase();
+  if(c==='W')return 'Wife';if(c==='WM')return 'Wife Without Maternity';if(c==='SO'||c==='S')return 'Son';if(c==='D')return 'Daughter';if(c==='H')return 'Husband';if(c==='E')return 'Employee';
+  const r=String(rel||'');if(MEMBER_TYPES.includes(r))return r;if(/wife without/i.test(r))return 'Wife Without Maternity';if(/wife/i.test(r))return 'Wife';if(/son/i.test(r))return 'Son';if(/daughter/i.test(r))return 'Daughter';if(/husband/i.test(r))return 'Husband';if(/employee/i.test(r))return 'Employee';return r||'Other';}
+
+function importMedicalCensus(input){
+  const f=input.files[0];if(!f)return;const r=new FileReader();
+  r.onload=e=>{try{
+    const wb=XLSX.read(e.target.result,{type:'array',cellDates:true});
+    const ws=pickSheet(wb,/medic|midec|census|bupa/i);
+    const rows=sheetRows(ws);
+    const insurerId=ensureInsurer(/bupa/i,'Bupa Arabia');
+    const staffToEmp={};let empN=0,depN=0,polN=0,skip=0;
+    // pass 1 — employees
+    rows.forEach(n=>{const rel=mapRelationship(gv(n,'relationshipcode','relationship code'),gv(n,'relationship'));
+      if(rel!=='Employee')return;
+      const staff=String(gv(n,'staffnumber','staff number','employee number','staff no')||'').trim();if(!staff)return;
+      const name=String(gv(n,'membername','member name','name')||'').trim();
+      const iqama=String(gv(n,'idno','id no','iqama','nationalid')||'').trim();
+      const cls=String(gv(n,'classdescription','class description','class')||'').trim().toUpperCase();
+      const grade=String(gv(n,'grade')||'').trim();
+      const patch={empNo:staff,name,gender:gv(n,'gender'),insuranceClass:CLASS_CODES.includes(cls)?cls:'',grade,glCode:String(gv(n,'gl code','glcode')||''),jobTitle:String(gv(n,'job title','jobtitle','position')||''),department:'',payer:/personal/i.test(gv(n,'insurance type','insurancetype'))?'Personal':'Company',iqamaExpiry:normDate(gv(n,'idexpirydate','id expiry date','iqama expiry')),status:/terminat/i.test(gv(n,'status'))?'Inactive':'Active'};
+      if(iqama&&!iqamaClash(iqama,'employees',(DB.all('employees').find(x=>x.empNo===staff)||{}).id))patch.iqama=iqama;
+      let ex=DB.all('employees').find(x=>String(x.empNo)===staff);
+      if(ex){DB.update('employees',ex.id,patch);}else{ex=DB.insert('employees',Object.assign({iqama:iqama||('NOID-'+staff)},patch));empN++;}
+      staffToEmp[staff]=ex.id;
+      // policy
+      const policyNo=String(gv(n,'policyno','policy no')||('MED-'+staff));
+      const eff=normDate(gv(n,'insurance effective date from','effective date from','effective date'))||'2026-01-01';
+      const exp=normDate(gv(n,'insurance effective date to','effective date to','expiry date'))||'2026-12-31';
+      let pol=DB.all('medPolicies').find(p=>p.employeeId===ex.id);
+      const pp={policyNo,insurer:insurerId,employeeId:ex.id,effectiveDate:eff,expiryDate:exp,plan:'Class '+cls,coverageClass:''};
+      if(pol){DB.update('medPolicies',pol.id,pp);}else{DB.insert('medPolicies',Object.assign({status:'Active',attachments:[]},pp));polN++;}
+    });
+    // pass 2 — dependents
+    rows.forEach(n=>{const code=gv(n,'relationshipcode','relationship code');const relRaw=gv(n,'relationship');const rel=mapRelationship(code,relRaw);
+      if(rel==='Employee')return;
+      const staff=String(gv(n,'staffnumber','staff number','main member id')||'').trim();const empId=staffToEmp[staff];if(!empId){skip++;return;}
+      const iqama=String(gv(n,'idno','id no','iqama')||'').trim();
+      if(iqama&&iqamaClash(iqama,'dependents',null)){skip++;return;}
+      DB.insert('dependents',{depNo:autoDepNo(),employeeId:empId,relationship:rel,name:String(gv(n,'membername','member name','name')||'').trim(),iqama:iqama||('NOID-'+uid()),gender:gv(n,'gender'),iqamaExpiry:normDate(gv(n,'idexpirydate','id expiry date')),payer:/personal/i.test(gv(n,'insurance type','insurancetype'))?'Personal':'Company',status:'Active'});depN++;
+    });
+    // recompute policy premiums from rate card
+    DB.all('medPolicies').forEach(p=>{const prem=calcMedicalPremium(p.employeeId);if(prem>0)DB.update('medPolicies',p.id,{annualPremium:prem,companyContribution:prem},{silent:true});});
+    refreshBadges();nav('medical');toast(`Census: ${empN} employees, ${depN} dependents, ${polN} policies.${skip?' '+skip+' skipped.':''}`,'ok');
+  }catch(err){toast('Census import failed: '+err.message,'err');}};
+  r.readAsArrayBuffer(f);input.value='';
+}
+
+function importLifeCensus(input){
+  const f=input.files[0];if(!f)return;const r=new FileReader();
+  r.onload=e=>{try{
+    const wb=XLSX.read(e.target.result,{type:'array',cellDates:true});const ws=pickSheet(wb,/life/i);
+    const rows=sheetRows(ws);const insurerId=ensureInsurer(/gig|life/i,'GIG Gulf Saudi');
+    let n=0,newEmp=0;
+    rows.forEach(o=>{const staff=String(gv(o,'employee number','employeenumber','empno','emp no')||'').trim();const name=String(gv(o,'insured name','name','member name')||'').trim();const prem=Number(String(gv(o,'premium','annual premium')||'').replace(/[^\d.]/g,''))||0;
+      if(!staff||!name)return;
+      let ex=DB.all('employees').find(x=>String(x.empNo)===staff);
+      if(!ex){ex=DB.insert('employees',{empNo:staff,name,iqama:'NOID-'+staff,status:'Active',jobTitle:String(gv(o,'occupation')||'')});newEmp++;}
+      const policyNo='LIF-'+staff;let pol=DB.all('lifePolicies').find(p=>p.employeeId===ex.id);
+      const pp={policyNo,insurer:insurerId,employeeId:ex.id,premium:prem,sumAssured:0,beneficiary:'',effectiveDate:'2026-01-01',expiryDate:'2026-12-31'};
+      if(pol)DB.update('lifePolicies',pol.id,pp);else{DB.insert('lifePolicies',Object.assign({status:'Active',attachments:[]},pp));n++;}
+    });
+    refreshBadges();nav('life');toast(`Life import: ${n} policies${newEmp?', '+newEmp+' new employees':''}.`,'ok');
+  }catch(err){toast('Life import failed: '+err.message,'err');}};
+  r.readAsArrayBuffer(f);input.value='';
+}
+
+function importGradeSheet(input){
+  const f=input.files[0];if(!f)return;const r=new FileReader();
+  r.onload=e=>{try{
+    const wb=XLSX.read(e.target.result,{type:'array',cellDates:true});const ws=pickSheet(wb,/f&a|f and a|grade|increment|payroll/i);
+    const rows=sheetRows(ws);let upd=0,ins=0;
+    rows.forEach(o=>{const staff=String(gv(o,'employee number','employeenumber','emp no','staffnumber')||'').trim();const name=String(gv(o,'employee name','name')||'').trim();
+      if(!staff||!name)return;
+      const grade=String(gv(o,'new grade','grade','current grade')||'').trim();
+      const cls=String(gv(o,'new class','current class','class')||'').trim().toUpperCase();
+      const patch={grade,jobTitle:String(gv(o,'new position name','current position name','position name extracted','position','job title')||''),nationality:String(gv(o,'nationality')||'')};
+      if(CLASS_CODES.includes(cls))patch.insuranceClass=cls;
+      let ex=DB.all('employees').find(x=>String(x.empNo)===staff);
+      if(ex){DB.update('employees',ex.id,patch);upd++;}else{DB.insert('employees',Object.assign({empNo:staff,name,iqama:'NOID-'+staff,status:'Active'},patch));ins++;}
+    });
+    refreshBadges();nav('employees');toast(`Grade sheet: ${upd} updated, ${ins} created.`,'ok');
+  }catch(err){toast('Grade import failed: '+err.message,'err');}};
+  r.readAsArrayBuffer(f);input.value='';
+}
+
+/* ============================================================
+   BILLING & STATEMENTS
+   ============================================================ */
+function billingLines(){
+  const lines=[];
+  DB.all('medPolicies').filter(p=>policyEff(p)==='Active').forEach(p=>{
+    const e=DB.byId('employees',p.employeeId);
+    policyMembers(p).forEach(m=>lines.push({type:'Medical',policyNo:p.policyNo,insurer:refLabel('insuranceCompanies',p.insurer),
+      company:refLabel('companies',e?e.company:''),bu:refLabel('businessUnits',e?e.businessUnit:''),division:refLabel('divisions',e?e.division:''),department:refLabel('departments',e?e.department:''),
+      empNo:e?e.empNo:'',member:m.name,idNo:m.idNo||'',relationship:m.rel,cls:m.cls||'',memberType:m.mtype||(m.norate?'—':''),payer:m.payer||'Company',glCode:m.glCode||'',annual:Number(m.premium||0),norate:m.norate}));
+  });
+  DB.all('lifePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>{const e=DB.byId('employees',p.employeeId);
+    lines.push({type:'Life',policyNo:p.policyNo,insurer:refLabel('insuranceCompanies',p.insurer),company:refLabel('companies',e?e.company:''),bu:refLabel('businessUnits',e?e.businessUnit:''),division:refLabel('divisions',e?e.division:''),department:refLabel('departments',e?e.department:''),
+      empNo:e?e.empNo:'',member:empName(p.employeeId),idNo:e?e.iqama:'',relationship:'Employee',cls:'',memberType:'Life',payer:'Company',glCode:e?e.glCode||'':'',annual:Number(p.premium||0)});});
+  DB.all('vehiclePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>{const e=DB.byId('employees',p.employeeId);
+    lines.push({type:'Vehicle',policyNo:p.policyNo,insurer:refLabel('insuranceCompanies',p.insurer),company:refLabel('companies',e?e.company:''),bu:refLabel('businessUnits',e?e.businessUnit:''),division:refLabel('divisions',e?e.division:''),department:'',
+      empNo:e?e.empNo:'',member:empName(p.employeeId)||p.vehicleMake||'',idNo:p.plateNo||'',relationship:'Vehicle',cls:'',memberType:p.coverType||'Vehicle',payer:'Company',glCode:'',annual:Number(p.premium||0)});});
+  lines.forEach(l=>l.monthly=+(l.annual/12).toFixed(2));
+  return lines;
+}
+let billFilter={q:'',type:'',insurer:'',payer:''};
+function renderBilling(){
+  const insurers=DB.all('insuranceCompanies');
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb">Finance</div><h2>🧾 Billing & Statements</h2></div>
+      <div class="actions">
+        ${can('export')?`<button class="btn btn-ghost" onclick="exportBilling()">⬇ Register (Excel)</button>`:''}
+        <button class="btn" onclick="statementForm()">＋ Generate Statement</button>
+      </div></div>
+    <div class="tabs">
+      ${['register','statements'].map(t=>`<div class="tab ${billTab===t?'active':''}" onclick="billTab='${t}';renderBilling()">${t==='register'?'Premium Register':'Saved Statements'}</div>`).join('')}
+    </div>
+    <div id="billBody"></div>`;
+  if(billTab==='statements'){renderStatementsList();return;}
+  document.getElementById('billBody').innerHTML=`
+    <div class="toolbar">
+      <input class="grow" placeholder="🔍 Search member, employee no, policy…" value="${esc(billFilter.q)}" oninput="billFilter.q=this.value;drawBilling()">
+      <select onchange="billFilter.type=this.value;drawBilling()"><option value="">All Lines</option>${['Medical','Life','Vehicle'].map(t=>`<option ${billFilter.type===t?'selected':''}>${t}</option>`).join('')}</select>
+      <select onchange="billFilter.insurer=this.value;drawBilling()"><option value="">All Insurers</option>${insurers.map(i=>`<option ${billFilter.insurer===i.name?'selected':''}>${esc(i.name)}</option>`).join('')}</select>
+      <select onchange="billFilter.payer=this.value;drawBilling()"><option value="">All Payers</option><option>Company</option><option>Personal</option></select>
+    </div>
+    <div id="billKpi" class="kpi-grid"></div>
+    <div class="card"><div class="table-wrap"><table>
+      <thead><tr><th>Type</th><th>Policy</th><th>Member</th><th>Emp No.</th><th>Relationship</th><th>Class</th><th>Payer</th><th>Insurer</th><th>GL Code</th><th class="right">Monthly</th><th class="right">Annual</th></tr></thead>
+      <tbody id="billBodyRows"></tbody></table></div></div>`;
+  drawBilling();
+}
+function filteredBilling(){
+  let ls=billingLines();
+  if(billFilter.type)ls=ls.filter(l=>l.type===billFilter.type);
+  if(billFilter.insurer)ls=ls.filter(l=>l.insurer===billFilter.insurer);
+  if(billFilter.payer)ls=ls.filter(l=>l.payer===billFilter.payer);
+  const q=billFilter.q.toLowerCase();if(q)ls=ls.filter(l=>[l.member,l.empNo,l.policyNo,l.idNo].join(' ').toLowerCase().includes(q));
+  return ls;
+}
+function drawBilling(){
+  const ls=filteredBilling();
+  const annual=ls.reduce((s,l)=>s+l.annual,0);
+  const company=ls.filter(l=>l.payer!=='Personal').reduce((s,l)=>s+l.annual,0);
+  const personal=+(annual-company).toFixed(2);
+  document.getElementById('billKpi').innerHTML=`
+    <div class="kpi"><div class="v">${ls.length}</div><div class="l">Billable Lines</div></div>
+    <div class="kpi info"><div class="v sm">${num(+(annual/12).toFixed(2))}</div><div class="l">Monthly Premium (SAR)</div></div>
+    <div class="kpi ok"><div class="v sm">${num(annual)}</div><div class="l">Annual Premium (SAR)</div></div>
+    <div class="kpi purple"><div class="v sm">${num(company)}</div><div class="l">Company Paid (Annual)</div></div>
+    <div class="kpi warn"><div class="v sm">${num(personal)}</div><div class="l">Personal Paid (Annual)</div></div>`;
+  const body=document.getElementById('billBodyRows');
+  if(!ls.length){body.innerHTML=`<tr><td colspan="11" class="empty">No billable lines.</td></tr>`;return;}
+  body.innerHTML=ls.map(l=>`<tr>
+    <td><span class="pill ${l.type==='Medical'?'green':l.type==='Life'?'blue':'grey'}">${l.type}</span></td>
+    <td>${esc(l.policyNo)}</td><td>${esc(l.member)}${l.norate?' <span class="pill amber" title="No rate for this member">no rate</span>':''}</td>
+    <td>${esc(l.empNo)}</td><td>${esc(l.relationship)}</td><td>${esc(l.cls)}</td>
+    <td>${esc(l.payer)}</td><td>${esc(l.insurer)}</td><td class="muted" style="font-size:11px">${esc(l.glCode)}</td>
+    <td class="right">${num(l.monthly)}</td><td class="right">${num(l.annual)}</td></tr>`).join('');
+}
+function exportBilling(){
+  const rows=filteredBilling().map(l=>({Type:l.type,Policy:l.policyNo,'Emp No':l.empNo,Member:l.member,'ID No':l.idNo,Relationship:l.relationship,Class:l.cls,'Member Type':l.memberType,Payer:l.payer,Insurer:l.insurer,Company:l.company,'Business Unit':l.bu,Division:l.division,Department:l.department,'GL Code':l.glCode,'Monthly SAR':l.monthly,'Annual SAR':l.annual}));
+  sheetDownload(rows,'Billing Register','billing_register');
+}
+/* ---- statements ---- */
+let billTab='register';
+function autoStatementNo(){const y=new Date().getFullYear();const n=DB.all('billings').filter(b=>(b.number||'').includes('BILL-'+y)).length+1;return `BILL-${y}-${String(n).padStart(4,'0')}`;}
+function statementForm(){
+  const insurers=DB.all('insuranceCompanies');const companies=DB.all('companies');
+  const now=new Date();
+  modal('Generate Billing Statement',`<div class="form-grid">
+    <div class="field"><label>Statement No.</label><input id="ff_no" value="${esc(autoStatementNo())}"></div>
+    <div class="field"><label>Basis</label><select id="ff_basis"><option value="monthly">Monthly</option><option value="annual">Annual</option></select></div>
+    <div class="field"><label>Insurer</label><select id="ff_ins"><option value="">All insurers</option>${insurers.map(i=>`<option>${esc(i.name)}</option>`).join('')}</select></div>
+    <div class="field"><label>Company</label><select id="ff_co"><option value="">All companies</option>${companies.map(c=>`<option>${esc(c.name)}</option>`).join('')}</select></div>
+    <div class="field"><label>Line Types</label><select id="ff_typ"><option value="">All (Medical + Life + Vehicle)</option><option>Medical</option><option>Life</option><option>Vehicle</option></select></div>
+    <div class="field"><label>Period</label><input id="ff_period" value="${now.toLocaleString('en',{month:'long'})} ${now.getFullYear()}"></div>
+  </div>`,[{label:'Cancel',cls:'btn-ghost',fn:closeModal},{label:'Generate',cls:'btn',fn:()=>{
+    const ins=val('ff_ins'),co=val('ff_co'),typ=val('ff_typ'),basis=val('ff_basis');
+    let ls=billingLines();
+    if(ins)ls=ls.filter(l=>l.insurer===ins);
+    if(co)ls=ls.filter(l=>l.company===co);
+    if(typ)ls=ls.filter(l=>l.type===typ);
+    if(!ls.length){toast('No billable lines match that selection.','err');return;}
+    const factor=basis==='monthly'?1/12:1;
+    const lines=ls.map(l=>({member:l.member,empNo:l.empNo,relationship:l.relationship,cls:l.cls,type:l.type,payer:l.payer,glCode:l.glCode,insurer:l.insurer,company:l.company,amount:+(l.annual*factor).toFixed(2)}));
+    const total=+lines.reduce((s,l)=>s+l.amount,0).toFixed(2);
+    const company=+lines.filter(l=>l.payer!=='Personal').reduce((s,l)=>s+l.amount,0).toFixed(2);
+    const rec=DB.insert('billings',{number:val('ff_no'),date:todayISO(),period:val('ff_period'),basis,insurer:ins||'All insurers',company:co||'All companies',lineType:typ||'All',lines,total,companyTotal:company,personalTotal:+(total-company).toFixed(2)});
+    closeModal();toast('Statement generated.','ok');billTab='statements';renderStatement(rec.id);
+  }}]);
+}
+function renderStatementsList(){
+  const bs=DB.all('billings').slice().reverse();
+  document.getElementById('billBody').innerHTML=`<div class="card"><div class="table-wrap"><table>
+    <thead><tr><th>Statement No.</th><th>Date</th><th>Period</th><th>Insurer</th><th>Company</th><th>Basis</th><th class="right">Total (SAR)</th><th class="right">Actions</th></tr></thead>
+    <tbody>${bs.length?bs.map(b=>`<tr style="cursor:pointer" onclick="renderStatement('${b.id}')"><td><b>${esc(b.number)}</b></td><td>${esc(b.date)}</td><td>${esc(b.period)}</td><td>${esc(b.insurer)}</td><td>${esc(b.company)}</td><td>${esc(b.basis)}</td><td class="right">${num(b.total)}</td>
+      <td onclick="event.stopPropagation()" class="right"><button class="icon-btn" onclick="renderStatement('${b.id}')">👁</button>${isAdmin()?`<button class="icon-btn danger" onclick="DB.remove('billings','${b.id}');renderBilling()">🗑</button>`:''}</td></tr>`).join(''):`<tr><td colspan="8" class="empty">No statements generated yet.</td></tr>`}</tbody></table></div></div>`;
+}
+function renderStatement(id){
+  const b=DB.byId('billings',id);if(!b){renderBilling();return;}
+  document.getElementById('main').innerHTML=`
+    <div class="page-head"><div><div class="crumb"><a href="#" onclick="billTab='statements';renderBilling();return false" style="color:var(--muted)">Statements</a> › ${esc(b.number)}</div>
+      <h2>Billing Statement ${esc(b.number)}</h2><div class="muted">${esc(b.period)} · ${esc(b.basis)} basis · ${esc(b.insurer)} · ${esc(b.company)}</div></div>
+      <div class="actions"><button class="btn btn-ghost" onclick="billTab='statements';renderBilling()">← Back</button>
+        ${can('export')?`<button class="btn btn-ghost" onclick="exportStatement('${b.id}')">⬇ Excel</button><button class="btn btn-ghost" onclick="printStatement('${b.id}')">🖨 Print</button>`:''}</div></div>
+    <div class="kpi-grid">
+      <div class="kpi"><div class="v sm">${num(b.total)}</div><div class="l">Statement Total (SAR)</div></div>
+      <div class="kpi purple"><div class="v sm">${num(b.companyTotal)}</div><div class="l">Company Payable</div></div>
+      <div class="kpi warn"><div class="v sm">${num(b.personalTotal)}</div><div class="l">Personal (Payroll Deduction)</div></div>
+      <div class="kpi muted"><div class="v">${b.lines.length}</div><div class="l">Lines</div></div>
+    </div>
+    <div class="card"><div class="card-h">Statement Lines</div><div class="table-wrap"><table>
+      <thead><tr><th>#</th><th>Member</th><th>Emp No.</th><th>Relationship</th><th>Class</th><th>Type</th><th>Payer</th><th>GL Code</th><th class="right">Amount (SAR)</th></tr></thead>
+      <tbody>${b.lines.map((l,i)=>`<tr><td>${i+1}</td><td>${esc(l.member)}</td><td>${esc(l.empNo)}</td><td>${esc(l.relationship)}</td><td>${esc(l.cls)}</td><td>${esc(l.type)}</td><td>${esc(l.payer)}</td><td class="muted" style="font-size:11px">${esc(l.glCode)}</td><td class="right">${num(l.amount)}</td></tr>`).join('')}
+      <tr style="font-weight:700;background:#f6f8fa"><td colspan="8">TOTAL</td><td class="right">${num(b.total)}</td></tr></tbody></table></div></div>`;
+}
+function exportStatement(id){const b=DB.byId('billings',id);const rows=b.lines.map((l,i)=>({'#':i+1,Member:l.member,'Emp No':l.empNo,Relationship:l.relationship,Class:l.cls,Type:l.type,Payer:l.payer,Insurer:l.insurer,Company:l.company,'GL Code':l.glCode,'Amount SAR':l.amount}));sheetDownload(rows,b.number,'statement_'+b.number);}
+function printStatement(id){const b=DB.byId('billings',id);printTable(`Billing Statement ${b.number} — ${b.period} (${b.basis})`,b.lines.map((l,i)=>({'#':i+1,Member:l.member,'Emp No':l.empNo,Relationship:l.relationship,Class:l.cls,Type:l.type,Payer:l.payer,'GL Code':l.glCode,'Amount SAR':l.amount})).concat([{'#':'','Member':'TOTAL','Emp No':'','Relationship':'','Class':'','Type':'','Payer':'','GL Code':'','Amount SAR':b.total}]));}
+
+/* ============================================================
    PREMIUM RATES
    ============================================================ */
 function renderPremiumRates(){
-  const card=getRateCard();const editable=can('master.edit');
-  const head=`<tr><th>Member Type \\ Class</th>${CLASSES.map(c=>`<th class="center">${esc(c.grade)}<br><b>${esc(c.code)}</b> · <span class="muted">${esc(c.network)}</span></th>`).join('')}</tr>`;
-  const body=MEMBER_TYPES.map((mt,mi)=>`<tr><td><b>${esc(mt)}</b></td>${CLASSES.map(c=>{const v=(card.rates[mt]&&card.rates[mt][c.code])||0;return `<td class="right">${editable?`<input id="rate_${mi}_${esc(c.code)}" type="number" step="any" value="${v}" style="width:92px;padding:5px 7px;border:1px solid var(--line);border-radius:6px;text-align:right">`:num(v)}</td>`;}).join('')}</tr>`).join('');
+  const card=getRateCard();const editable=can('master.edit');const bands=getBands().slice().sort((a,b)=>b.min-a.min);
+  const head=`<tr><th>Member Type \\ Class</th>${CLASSES.map(c=>`<th class="center"><span class="muted" style="font-weight:400;font-size:10.5px">${esc(c.grade)}</span><br><b>Class ${esc(c.code)}</b></th>`).join('')}</tr>`;
+  const bodyRows=MEMBER_TYPES.map((mt,mi)=>`<tr><td><b>${esc(mt)}</b></td>${CLASSES.map(c=>{const v=(card.rates[mt]&&card.rates[mt][c.code])||0;return `<td class="right">${editable?`<input id="rate_${mi}_${esc(c.code)}" type="number" step="any" value="${v}" style="width:92px;padding:5px 7px;border:1px solid var(--line);border-radius:6px;text-align:right">`:num(v)}</td>`;}).join('')}</tr>`).join('');
+  const bandRows=CLASSES.map(c=>{const b=bands.find(x=>x.cls===c.code)||{min:c.min};return `<tr><td><b>Class ${esc(c.code)}</b></td><td>${editable?`GEN.<input id="band_${esc(c.code)}" type="number" value="${b.min}" style="width:70px;padding:5px 7px;border:1px solid var(--line);border-radius:6px"> + Above`:'GEN.'+b.min+' + Above'}</td></tr>`;}).join('');
   document.getElementById('main').innerHTML=`
     <div class="page-head"><div><div class="crumb">Configuration</div><h2>💲 Premium Rates</h2></div>
       <div class="actions">
@@ -1342,9 +1615,16 @@ function renderPremiumRates(){
     <div class="toolbar">
       <label class="muted" style="display:flex;align-items:center;gap:6px">Rate Year <input id="rateYear" type="number" value="${esc(card.year||new Date().getFullYear())}" style="width:90px;padding:7px 9px;border:1px solid var(--line);border-radius:7px" ${editable?'':'disabled'}></label>
     </div>
-    <div class="card"><div class="card-h">Agreed Annual Premium Rate Card <span class="sub">SAR per member / year · classes map to employee grade bands</span></div>
-      <div class="table-wrap"><table><thead>${head}</thead><tbody>${body}</tbody></table></div></div>
-    <p class="muted" style="font-size:12px">Each class maps to a grade band (e.g. GEN 19+ → VIP / NW7). The medical policy form's <b>↺ Auto-Premium</b> reads these rates by the employee's class and coverage scope, summing employee + dependents — and the amount stays editable as an override.</p>`;
+    <div class="grid2">
+      <div class="card" style="grid-column:1/-1"><div class="card-h">Agreed Annual Premium Rate Card <span class="sub">SAR per member / year — priced by Class × Relationship</span></div>
+        <div class="table-wrap"><table><thead>${head}</thead><tbody>${bodyRows}</tbody></table></div></div>
+      <div class="card"><div class="card-h">Grade → Class Mapping <span class="sub">band floor per class</span>
+        ${editable?`<button class="btn btn-sm" onclick="saveBands()">Save Mapping</button>`:''}</div>
+        <div class="table-wrap"><table><thead><tr><th>Class</th><th>Applies to Grade</th></tr></thead><tbody>${bandRows}</tbody></table></div>
+        <div class="card-b muted" style="font-size:11.5px">An employee's class is taken from their explicit Insurance Class, or derived from Grade using these floors (e.g. GEN.16 → A). Highest matching band wins.</div></div>
+      <div class="card"><div class="card-h">How pricing works</div><div class="card-b muted" style="font-size:12px;line-height:1.7">
+        Each medical policy is priced <b>per member</b>: the employee line uses their Medical Member Type (Employee / Female Employee with Maternity / Senior Employee), and every active dependent is priced by its Relationship — all at the employee's class. The policy premium is the sum. The <b>↺ Auto-Premium</b> button on the medical form fills this in, and any manual figure that differs is flagged <b>off-rate</b>.</div></div>
+    </div>`;
 }
 function saveRates(){
   if(!can('master.edit'))return;
@@ -1354,17 +1634,32 @@ function saveRates(){
   if(DB.byId('premiumRates','card'))DB.update('premiumRates','card',{rates:card.rates,year:yr});else DB.insert('premiumRates',{id:'card',year:yr,rates:card.rates});
   toast('Premium rates saved.','ok');
 }
-function exportRates(){const card=getRateCard();const rows=MEMBER_TYPES.map(mt=>{const o={'Member Type':mt};CLASSES.forEach(c=>o[c.code+' ('+c.network+')']=(card.rates[mt]&&card.rates[mt][c.code])||0);return o;});sheetDownload(rows,'Premium Rates','premium_rates');}
+function saveBands(){
+  if(!can('master.edit'))return;
+  const bands=CLASSES.map(c=>({cls:c.code,min:Number(val('band_'+c.code))||c.min}));
+  if(DB.byId('gradeBands','card'))DB.update('gradeBands','card',{bands});else DB.insert('gradeBands',{id:'card',bands});
+  toast('Grade → Class mapping saved.','ok');renderPremiumRates();
+}
+function exportRates(){const card=getRateCard();const rows=MEMBER_TYPES.map(mt=>{const o={'Member Type':mt};CLASSES.forEach(c=>o['Class '+c.code]=(card.rates[mt]&&card.rates[mt][c.code])||0);return o;});sheetDownload(rows,'Premium Rates','premium_rates');}
 function importRates(input){
   const f=input.files[0];if(!f)return;const r=new FileReader();
   r.onload=e=>{try{
-    const wb=XLSX.read(e.target.result,{type:'array'});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
+    const wb=XLSX.read(e.target.result,{type:'array'});
+    // supports either a matrix (Member Type + class columns) or the long form (Class Description, Relationship, Premium)
+    const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
     const card=clone(getRateCard());card.rates=card.rates||{};let n=0;
-    rows.forEach(row=>{let mt='';for(const k in row){const kk=k.toLowerCase();if(kk.includes('member')){mt=String(row[k]).trim();break;}}
-      if(!mt)return;const match=MEMBER_TYPES.find(x=>x.toLowerCase()===mt.toLowerCase());if(!match)return;card.rates[match]=card.rates[match]||{};
-      CLASSES.forEach(c=>{for(const k in row){const ku=k.toUpperCase();if(ku===c.code||ku.startsWith(c.code+' ')||ku.startsWith(c.code+'(')||ku.includes('('+c.network+')')||ku===c.network){const v=Number(String(row[k]).replace(/[^\d.]/g,''));if(!isNaN(v))card.rates[match][c.code]=v;}}});n++;});
+    const longForm=rows.some(r=>Object.keys(r).some(k=>/relationship/i.test(k)))&&rows.some(r=>Object.keys(r).some(k=>/class/i.test(k)));
+    if(longForm){
+      rows.forEach(row=>{let cls='',rel='',prem='';for(const k in row){const kk=k.toLowerCase();if(kk.includes('class'))cls=String(row[k]).trim();else if(kk.includes('relationship')||kk.includes('member'))rel=String(row[k]).trim();else if(kk.includes('premium')||kk.includes('rate'))prem=row[k];}
+        const C=CLASS_CODES.find(x=>x.toLowerCase()===cls.toLowerCase());const M=MEMBER_TYPES.find(x=>x.toLowerCase()===rel.toLowerCase());const v=Number(String(prem).replace(/[^\d.]/g,''));
+        if(C&&M&&!isNaN(v)){card.rates[M]=card.rates[M]||{};card.rates[M][C]=v;n++;}});
+    }else{
+      rows.forEach(row=>{let mt='';for(const k in row){if(/member/i.test(k)){mt=String(row[k]).trim();break;}}
+        const match=MEMBER_TYPES.find(x=>x.toLowerCase()===mt.toLowerCase());if(!match)return;card.rates[match]=card.rates[match]||{};
+        CLASSES.forEach(c=>{for(const k in row){const ku=k.toUpperCase().replace('CLASS','').trim();if(ku===c.code){const v=Number(String(row[k]).replace(/[^\d.]/g,''));if(!isNaN(v))card.rates[match][c.code]=v;}}});n++;});
+    }
     if(DB.byId('premiumRates','card'))DB.update('premiumRates','card',{rates:card.rates});else DB.insert('premiumRates',{id:'card',year:card.year,rates:card.rates});
-    renderPremiumRates();toast(`Imported rates for ${n} member type(s).`,'ok');
+    renderPremiumRates();toast(`Imported ${n} rate cell(s)/row(s).`,'ok');
   }catch(err){toast('Import failed: '+err.message,'err');}};
   r.readAsArrayBuffer(f);input.value='';
 }
@@ -1383,7 +1678,7 @@ const REPORTS=[
   {key:'costCompany',name:'Insurance Cost by Company',build:()=>{const o={};const add=(p,prem)=>{const k=refLabel('companies',empCompany(p.employeeId))||'—';o[k]=o[k]||{Company:k,Policies:0,'Annual Cost SAR':0};o[k].Policies++;o[k]['Annual Cost SAR']+=prem;};DB.all('medPolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.annualPremium||0)));DB.all('lifePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));DB.all('vehiclePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));return Object.values(o);}},
   {key:'costInsurer',name:'Cost by Insurance Company',build:()=>{const o={};const add=(p,prem)=>{const k=refLabel('insuranceCompanies',p.insurer)||'—';o[k]=o[k]||{Insurer:k,Policies:0,'Annual Cost SAR':0};o[k].Policies++;o[k]['Annual Cost SAR']+=prem;};DB.all('medPolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.annualPremium||0)));DB.all('lifePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));DB.all('vehiclePolicies').filter(p=>policyEff(p)==='Active').forEach(p=>add(p,Number(p.premium||0)));return Object.values(o);}},
   {key:'amortSummary',name:'Premium Amortization Summary',build:()=>{const out=[];POLICY_KINDS.forEach(kind=>{const cfg=POLICIES[kind];DB.all(cfg.coll).filter(p=>policyEff(p)==='Active').forEach(p=>{const rows=amortRows(cfg,p);if(!rows.length)return;const elapsed=rows.filter(r=>r.period<=todayISO().slice(0,7));const expensed=elapsed.length?elapsed[elapsed.length-1].cumulative:0;out.push({'Type':cfg.short.replace(' Policy',''),'Policy No':p.policyNo,'Holder':empName(p.employeeId)||p.vehicleMake||'—','Premium SAR':premiumOf(cfg,p),'Months':rows.length,'Monthly SAR':rows[0].amount,'Expensed to Date SAR':expensed,'Prepaid Remaining SAR':+(premiumOf(cfg,p)-expensed).toFixed(2)});});});return out;}},
-  {key:'rateCard',name:'Premium Rate Card',build:()=>{const c=getRateCard();return MEMBER_TYPES.map(mt=>{const o={'Member Type':mt};CLASSES.forEach(cl=>o[cl.code+' / '+cl.network]=(c.rates[mt]&&c.rates[mt][cl.code])||0);return o;});}},
+  {key:'rateCard',name:'Premium Rate Card',build:()=>{const c=getRateCard();return MEMBER_TYPES.map(mt=>{const o={'Member Type':mt};CLASSES.forEach(cl=>o['Class '+cl.code]=(c.rates[mt]&&c.rates[mt][cl.code])||0);return o;});}},
   {key:'premiumVariance',name:'Premium vs Rate Card (Off-Rate)',build:()=>DB.all('medPolicies').map(p=>{const v=medPremiumVariance(p);return {'Policy No':p.policyNo,'Employee':empName(p.employeeId),'Grade':(DB.byId('employees',p.employeeId)||{}).grade||'','Class':v?(v.cls||'—'):'—','Coverage':p.coverageClass||'','Entered SAR':Number(p.annualPremium||0),'Rate-Card SAR':v&&!v.noClass?v.expected:'','Variance SAR':v&&!v.noClass?v.diff:'','Status':!v?'—':v.noClass?'No class':v.off?'OFF-RATE':'On rate'};}).sort((a,b)=>(a.Status==='OFF-RATE'?0:1)-(b.Status==='OFF-RATE'?0:1))},
   {key:'audit',name:'Audit Log',build:()=>DB.all('audit').slice().reverse().map(a=>({Timestamp:new Date(a.ts).toLocaleString(),User:a.user,Role:a.role,Action:a.action,Entity:a.entity,Record:a.recordLabel,Changes:(a.changes||[]).map(c=>`${c.field}: ${fmtChange(c.old)}→${fmtChange(c.new)}`).join('; ')}))}
 ];
